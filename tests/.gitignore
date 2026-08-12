@@ -1,0 +1,13 @@
+# Generated test outputs (recreated by run_validation.sh)
+*-outputs_after/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime logs
+*.log
+gmon.out
+
+# Temporary backup files from T01 patching
+*.bak
