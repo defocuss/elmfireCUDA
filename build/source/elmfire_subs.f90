@@ -389,6 +389,63 @@ END SUBROUTINE INTERP_WD_RASTER
 ! *****************************************************************************
 
 ! *****************************************************************************
+SUBROUTINE INTERP_WD_RASTER_NL(L,WD_LO,WD_HI,F) ! List of nodes version of INTERP_WD_RASTER
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: L
+REAL, DIMENSION(:,:), INTENT(IN) :: WD_LO, WD_HI
+REAL, INTENT(IN) :: F
+INTEGER :: I, ICOL, IROW
+REAL :: WD1TO, WD2TO, WDTO
+!TYPE(NODE), POINTER :: C
+
+!C => L%HEAD
+DO I = 1, L%NUM_NODES
+   ICOL = ICOL_ANALYSIS_F2C(L%IX(I))
+   IROW = IROW_ANALYSIS_F2C(L%IY(I))
+   WD1TO = WD_LO(ICOL,IROW) + 180. ; IF (WD1TO .GT. 360) WD1TO = WD1TO - 360.
+   WD2TO = WD_HI(ICOL,IROW) + 180. ; IF (WD2TO .GT. 360) WD2TO = WD2TO - 360.
+   WDTO = WD1TO + F * (WD2TO - WD1TO)
+   L%WD20_INTERP(I) = WDTO + 180. + PERTURB_WD
+   IF (L%WD20_INTERP(I) .GT. 360.) L%WD20_INTERP(I) = L%WD20_INTERP(I) - 360.
+   IF (L%WD20_INTERP(I) .LT.   0.) L%WD20_INTERP(I) = L%WD20_INTERP(I) + 360.
+   L%WD20_NOW(I) = L%WD20_INTERP(I)
+   !C => C%NEXT
+ENDDO
+  
+! *****************************************************************************
+END SUBROUTINE INTERP_WD_RASTER_NL
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE INTERP_WD_RASTER_SINGLE_NL(NL,NODE_INDEX,WD_LO,WD_HI,F) ! List of nodes version of INTERP_WD_RASTER_SINGLE
+! *****************************************************************************
+
+TYPE(NODE_LIST), INTENT(INOUT) :: NL
+REAL, DIMENSION(:,:), INTENT(IN) :: WD_LO, WD_HI
+REAL, INTENT(IN) :: F
+INTEGER :: ICOL, IROW, NODE_INDEX
+REAL :: WD1TO, WD2TO, WDTO
+!TYPE(NODE), POINTER :: C
+
+!C => NODEIN
+
+ICOL = ICOL_ANALYSIS_F2C(NL%IX(NODE_INDEX))
+IROW = IROW_ANALYSIS_F2C(NL%IY(NODE_INDEX))
+WD1TO = WD_LO(ICOL,IROW) + 180. ; IF (WD1TO .GT. 360) WD1TO = WD1TO - 360.
+WD2TO = WD_HI(ICOL,IROW) + 180. ; IF (WD2TO .GT. 360) WD2TO = WD2TO - 360.
+WDTO = WD1TO + F * (WD2TO - WD1TO)
+NL%WD20_INTERP(NODE_INDEX) = WDTO + 180. + PERTURB_WD
+IF (NL%WD20_INTERP(NODE_INDEX) .GT. 360.) NL%WD20_INTERP(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX) - 360.
+IF (NL%WD20_INTERP(NODE_INDEX) .LT.   0.) NL%WD20_INTERP(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX) + 360.
+
+NL%WD20_NOW(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX)
+  
+! *****************************************************************************
+END SUBROUTINE INTERP_WD_RASTER_SINGLE_NL
+! *****************************************************************************
+
+! *****************************************************************************
 SUBROUTINE INTERP_WD_RASTER_SINGLE(NODEIN,WD_LO,WD_HI,F)
 ! *****************************************************************************
 
@@ -501,6 +558,150 @@ END SELECT
 
 ! *****************************************************************************
 END SUBROUTINE INTERP_RASTER_LINKEDLIST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE INTERP_RASTER_NODE_LIST(L,LO,HI,F,IQUANTITY) ! List of node version of INTERP_RASTER_LINKEDLIST
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: L
+REAL, DIMENSION(:,:), INTENT(IN ) :: LO,HI
+INTEGER, INTENT(IN) :: IQUANTITY
+REAL, INTENT(IN) :: F
+INTEGER :: I,ICOL,IROW
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+
+!C => L%HEAD
+
+SELECT CASE (IQUANTITY)
+
+   CASE (1)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%M1(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%M1(I) = MAX (L%M1(I) + PERTURB_M1, 0.01)
+         !C => C%NEXT
+      ENDDO
+
+   CASE (2)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%M10(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%M10(I) = MAX (L%M10(I) + PERTURB_M10, 0.01)
+         !C => C%NEXT
+      ENDDO
+
+   CASE (3)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%M100(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%M100(I) = MAX (L%M100(I) + PERTURB_M100, 0.01)
+         !C => C%NEXT
+      ENDDO
+
+   CASE (4)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%MLH(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%MLH(I) = MAX(L%MLH(I) + PERTURB_MLH, 0.3)
+         !C => C%NEXT
+      ENDDO
+
+   CASE (5)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%MLW(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%MLW(I) = MAX(L%MLW(I) + PERTURB_MLW, 0.6)
+         !C => C%NEXT
+      ENDDO
+
+   CASE (6)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%FMC(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%FMC(I) = L%FMC(I) + PERTURB_FMC
+         !C => C%NEXT
+      ENDDO
+
+   CASE (7)
+      DO I = 1, L%NUM_NODES
+         ICOL = WX_ICOL_FROM_ANALYSIS_IX(L%IX(I))
+         IROW = WX_IROW_FROM_ANALYSIS_IY(L%IY(I))
+         L%WS20_INTERP(I) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+         L%WS20_INTERP(I) = MAX(L%WS20_INTERP(I) + PERTURB_WS, 0.0)
+         L%WS20_NOW(I) = L%WS20_INTERP(I)
+         L%WSMF(I) = L%WS20_NOW(I) * MAX((WAF%R4(L%IX(I),L%IY(I),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+         !C => C%NEXT
+      ENDDO
+
+END SELECT
+
+! *****************************************************************************
+END SUBROUTINE INTERP_RASTER_NODE_LIST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE INTERP_RASTER_LINKEDLIST_BILINEAR_NL(L,LO,HI,F,IQUANTITY) ! List of nodes version of INTERP_RASTER_LINKEDLIST_BILINEAR
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: L
+REAL, DIMENSION(:,:), INTENT(IN) :: LO,HI
+INTEGER, INTENT(IN) :: IQUANTITY
+REAL, INTENT(IN) :: F
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+REAL :: X1, X2, Y1, Y2, CX, CY, PL, PH, PNOW
+REAL :: Q11L, Q21L, Q12L, Q22L, Q11H, Q21H, Q12H, Q22H
+INTEGER :: I, I1, I2, J1, J2
+
+!C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+    
+   CALL GET_BILINEAR_INTERPOLATE_COEFFS(L%IX(I), l%IY(I), X1, Y1, X2, Y2, I1, J1, I2, J2, CX, CY)
+
+   Q12L = LO(I1, J2) ; Q22L = LO(I2, J2)
+   Q11L = LO(I1, J1) ; Q21L = LO(I2, J1)
+   PL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, Q11L, Q21L, Q12L, Q22L)
+         
+   Q12H = HI(I1, J2) ; Q22H = HI(I2, J2)
+   Q11H = HI(I1, J1) ; Q21H = HI(I2, J1)
+   PH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, Q11H, Q21H, Q12H, Q22H)
+   
+   PNOW = PL + F * (PH - PL)
+
+   SELECT CASE (IQUANTITY)
+      CASE (1)
+         L%M1(I)   = MAX (PNOW + PERTURB_M1  , 0.01)
+      CASE (2)
+         L%M10(I)  = MAX (PNOW + PERTURB_M10 , 0.01)
+      CASE (3)
+         L%M100(I) = MAX (PNOW + PERTURB_M100, 0.01)
+      CASE (4)
+         L%MLH(I)  = MAX (PNOW + PERTURB_MLH , 0.30)
+      CASE (5)
+         L%MLW(I)  = MAX (PNOW + PERTURB_MLW , 0.60)
+      CASE (6)
+         L%FMC(I) = PNOW + PERTURB_FMC
+      CASE (7)
+         L%WS20_INTERP(I) = MAX(PNOW + PERTURB_WS, 0.0)
+         L%WS20_NOW(I) = L%WS20_INTERP(I)
+         L%WSMF(I) = L%WS20_NOW(I) * MAX((WAF%R4(L%IX(I),L%IY(I),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+      END SELECT
+   
+   !C => C%NEXT
+
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE INTERP_RASTER_LINKEDLIST_BILINEAR_NL
 ! *****************************************************************************
 
 ! *****************************************************************************
@@ -666,6 +867,111 @@ END SUBROUTINE INTERP_WIND_LINKEDLIST_BILINEAR
 ! *****************************************************************************
 
 ! *****************************************************************************
+SUBROUTINE INTERP_WIND_LINKEDLIST_BILINEAR_NL(L,WSLO,WSHI,WDLO,WDHI,F) !List of node version of INTERP_WIND_LINKEDLIST_BILINEAR
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: L
+REAL, DIMENSION(:,:), INTENT(IN) :: WSLO,WSHI,WDLO,WDHI
+REAL, INTENT(IN) :: F
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+REAL :: X1, X2, Y1, Y2, CX, CY
+REAL :: WS11L, WS21L, WS12L, WS22L, WS11H, WS21H, WS12H, WS22H, &
+        WD11L, WD21L, WD12L, WD22L, WD11H, WD21H, WD12H, WD22H, &
+        UX11L, UX21L, UX12L, UX22L, UX11H, UX21H, UX12H, UX22H, &
+        UY11L, UY21L, UY12L, UY22L, UY11H, UY21H, UY12H, UY22H
+REAL :: UXL, UXH, UYL, UYH, UXNOW, UYNOW, WSNOW, WDNOW
+
+INTEGER :: I, I1, I2, J1, J2
+
+!C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+    
+   CALL GET_BILINEAR_INTERPOLATE_COEFFS(L%IX(I), L%IY(I), X1, Y1, X2, Y2, I1, J1, I2, J2, CX, CY)
+
+! Wind speed and wind direction (lo)
+   WS12L = WSLO(I1, J2) ; WS22L = WSLO(I2, J2)
+   WS11L = WSLO(I1, J1) ; WS21L = WSLO(I2, J1)
+   
+   WD12L = WDLO(I1, J2) ; WD22L = WDLO(I2, J2)
+   WD11L = WDLO(I1, J1) ; WD21L = WDLO(I2, J1)
+
+! Convert to x and y components
+   UX12L = UX_FROM_WSWD(WS12L, WD12L) ; UX22L = UX_FROM_WSWD(WS22L, WD22L)
+   UX11L = UX_FROM_WSWD(WS11L, WD11L) ; UX21L = UX_FROM_WSWD(WS21L, WD21L)
+
+   UY12L = UY_FROM_WSWD(WS12L, WD12L) ; UY22L = UY_FROM_WSWD(WS22L, WD22L)
+   UY11L = UY_FROM_WSWD(WS11L, WD11L) ; UY21L = UY_FROM_WSWD(WS21L, WD21L)
+   
+! Interpolate spatially
+   UXL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UX11L, UX21L, UX12L, UX22L)
+   UYL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UY11L, UY21L, UY12L, UY22L)
+
+! Wind speed and wind direction (hi)
+   WS12H = WSHI(I1, J2) ; WS22H = WSHI(I2, J2)
+   WS11H = WSHI(I1, J1) ; WS21H = WSHI(I2, J1)
+   
+   WD12H = WDHI(I1, J2) ; WD22H = WDHI(I2, J2)
+   WD11H = WDHI(I1, J1) ; WD21H = WDHI(I2, J1)
+
+! Convert to x and y components
+   UX12H = UX_FROM_WSWD(WS12H, WD12H) ; UX22H = UX_FROM_WSWD(WS22H, WD22H)
+   UX11H = UX_FROM_WSWD(WS11H, WD11H) ; UX21H = UX_FROM_WSWD(WS21H, WD21H)
+
+   UY12H = UY_FROM_WSWD(WS12H, WD12H) ; UY22H = UY_FROM_WSWD(WS22H, WD22H)
+   UY11H = UY_FROM_WSWD(WS11H, WD11H) ; UY21H = UY_FROM_WSWD(WS21H, WD21H)
+   
+! Interpolate spatially
+   UXH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UX11H, UX21H, UX12H, UX22H)
+   UYH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UY11H, UY21H, UY12H, UY22H)
+
+! Interpolate temporally
+   UXNOW = UXL + F * (UXH - UXL)
+   UYNOW = UYL + F * (UYH - UYL)
+   
+! Convert to wind speed and direction
+   IF      (UXNOW .EQ. 0. .AND. UYNOW .EQ. 0.) THEN 
+      WDNOW = 0.
+   ELSE IF (UXNOW .GT. 0. .AND. UYNOW .EQ. 0.) THEN
+      WDNOW = 0.5*PI
+   ELSE IF (UXNOW .LT. 0. .AND. UYNOW .EQ. 0.) THEN          
+      WDNOW = 1.5*PI          
+   ELSE IF (UXNOW .EQ. 0. .AND. UYNOW .GT. 0.) THEN
+      WDNOW = 0.0*PI
+   ELSE IF (UXNOW .EQ. 0. .AND. UYNOW .LT. 0.) THEN          
+      WDNOW = 1.0*PI
+   ELSE
+      IF (UXNOW .GT. 0. .AND. UYNOW .GT. 0.) WDNOW = 0.     + ATAN(  UXNOW /  UYNOW ) 
+      IF (UXNOW .GT. 0. .AND. UYNOW .LT. 0.) WDNOW = 0.5*PI + ATAN( -UYNOW /  UXNOW )
+      IF (UXNOW .LT. 0. .AND. UYNOW .LT. 0.) WDNOW = PI     + ATAN(  UXNOW /  UYNOW )
+      IF (UXNOW .LT. 0. .AND. UYNOW .GT. 0.) WDNOW = 1.5*PI + ATAN(  UYNOW / ABS(UXNOW) )
+   ENDIF
+
+   WSNOW = SQRT(UXNOW*UXNOW + UYNOW*UYNOW)
+   
+   WDNOW = WDNOW * 180. / PI
+   WDNOW = WDNOW + 180. 
+   IF (WDNOW .GT. 360) WDNOW = WDNOW - 360.
+
+   L%WD20_INTERP(I) = WDNOW + PERTURB_WD
+   IF (L%WD20_INTERP(I) .GT. 360.) L%WD20_INTERP(I) = L%WD20_INTERP(I) - 360.
+   IF (L%WD20_INTERP(I) .LT.   0.) L%WD20_INTERP(I) = L%WD20_INTERP(I) + 360.
+   L%WD20_NOW(I) = L%WD20_INTERP(I)
+
+   L%WS20_INTERP(I) = MAX(WSNOW + PERTURB_WS, 0.0)
+   L%WS20_NOW(I) = L%WS20_INTERP(I)
+   L%WSMF(I) = L%WS20_NOW(I) * MAX((WAF%R4(L%IX(I),L%IY(I),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+   
+   !C => C%NEXT
+
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE INTERP_WIND_LINKEDLIST_BILINEAR_NL
+! *****************************************************************************
+
+! *****************************************************************************
 SUBROUTINE INTERP_WIND_SINGLE_BILINEAR(NODEIN,WSLO,WSHI,WDLO,WDHI,F)
 ! *****************************************************************************
 
@@ -761,6 +1067,105 @@ C%WSMF = C%WS20_NOW * MAX((WAF%R4(C%IX,C%IY,1) + PERTURB_WAF),0.) * CONVERSION_F
    
 ! *****************************************************************************
 END SUBROUTINE INTERP_WIND_SINGLE_BILINEAR
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE INTERP_WIND_SINGLE_BILINEAR_NL(NL,NODE_INDEX,WSLO,WSHI,WDLO,WDHI,F) ! List of nodes version of INTERP_WIND_SINGLE_BILINEAR
+! *****************************************************************************
+
+TYPE(NODE_LIST), INTENT(INOUT) :: NL
+INTEGER, INTENT(IN) :: NODE_INDEX
+REAL, DIMENSION(:,:), INTENT(IN) :: WSLO,WSHI,WDLO,WDHI
+REAL, INTENT(IN) :: F
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+REAL :: X1, X2, Y1, Y2, CX, CY
+REAL :: WS11L, WS21L, WS12L, WS22L, WS11H, WS21H, WS12H, WS22H, &
+        WD11L, WD21L, WD12L, WD22L, WD11H, WD21H, WD12H, WD22H, &
+        UX11L, UX21L, UX12L, UX22L, UX11H, UX21H, UX12H, UX22H, &
+        UY11L, UY21L, UY12L, UY22L, UY11H, UY21H, UY12H, UY22H
+REAL :: UXL, UXH, UYL, UYH, UXNOW, UYNOW, WSNOW, WDNOW
+
+INTEGER :: I1, I2, J1, J2
+
+!C => NODEIN
+    
+CALL GET_BILINEAR_INTERPOLATE_COEFFS(NL%IX(NODE_INDEX), NL%IY(NODE_INDEX), X1, Y1, X2, Y2, I1, J1, I2, J2, CX, CY)
+
+! Wind speed and wind direction (lo)
+WS12L = WSLO(I1, J2) ; WS22L = WSLO(I2, J2)
+WS11L = WSLO(I1, J1) ; WS21L = WSLO(I2, J1)
+   
+WD12L = WDLO(I1, J2) ; WD22L = WDLO(I2, J2)
+WD11L = WDLO(I1, J1) ; WD21L = WDLO(I2, J1)
+
+! Convert to x and y components
+UX12L = UX_FROM_WSWD(WS12L, WD12L) ; UX22L = UX_FROM_WSWD(WS22L, WD22L)
+UX11L = UX_FROM_WSWD(WS11L, WD11L) ; UX21L = UX_FROM_WSWD(WS21L, WD21L)
+
+UY12L = UY_FROM_WSWD(WS12L, WD12L) ; UY22L = UY_FROM_WSWD(WS22L, WD22L)
+UY11L = UY_FROM_WSWD(WS11L, WD11L) ; UY21L = UY_FROM_WSWD(WS21L, WD21L)
+   
+! Interpolate spatially
+UXL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UX11L, UX21L, UX12L, UX22L)
+UYL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UY11L, UY21L, UY12L, UY22L)
+
+! Wind speed and wind direction (hi)
+WS12H = WSHI(I1, J2) ; WS22H = WSHI(I2, J2)
+WS11H = WSHI(I1, J1) ; WS21H = WSHI(I2, J1)
+WD12H = WDHI(I1, J2) ; WD22H = WDHI(I2, J2)
+WD11H = WDHI(I1, J1) ; WD21H = WDHI(I2, J1)
+
+! Convert to x and y components
+UX12H = UX_FROM_WSWD(WS12H, WD12H) ; UX22H = UX_FROM_WSWD(WS22H, WD22H)
+UX11H = UX_FROM_WSWD(WS11H, WD11H) ; UX21H = UX_FROM_WSWD(WS21H, WD21H)
+
+UY12H = UY_FROM_WSWD(WS12H, WD12H) ; UY22H = UY_FROM_WSWD(WS22H, WD22H)
+UY11H = UY_FROM_WSWD(WS11H, WD11H) ; UY21H = UY_FROM_WSWD(WS21H, WD21H)
+   
+! Interpolate spatially
+UXH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UX11H, UX21H, UX12H, UX22H)
+UYH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, UY11H, UY21H, UY12H, UY22H)
+
+! Interpolate temporally
+UXNOW = UXL + F * (UXH - UXL)
+UYNOW = UYL + F * (UYH - UYL)
+   
+! Convert to wind speed and direction
+IF      (UXNOW .EQ. 0. .AND. UYNOW .EQ. 0.) THEN 
+   WDNOW = 0.
+ELSE IF (UXNOW .GT. 0. .AND. UYNOW .EQ. 0.) THEN
+   WDNOW = 0.5*PI
+ELSE IF (UXNOW .LT. 0. .AND. UYNOW .EQ. 0.) THEN          
+   WDNOW = 1.5*PI          
+ELSE IF (UXNOW .EQ. 0. .AND. UYNOW .GT. 0.) THEN
+   WDNOW = 0.0*PI
+ELSE IF (UXNOW .EQ. 0. .AND. UYNOW .LT. 0.) THEN          
+   WDNOW = 1.0*PI
+ELSE
+   IF (UXNOW .GT. 0. .AND. UYNOW .GT. 0.) WDNOW = 0.     + ATAN(  UXNOW /  UYNOW ) 
+   IF (UXNOW .GT. 0. .AND. UYNOW .LT. 0.) WDNOW = 0.5*PI + ATAN( -UYNOW /  UXNOW )
+   IF (UXNOW .LT. 0. .AND. UYNOW .LT. 0.) WDNOW = PI     + ATAN(  UXNOW /  UYNOW )
+   IF (UXNOW .LT. 0. .AND. UYNOW .GT. 0.) WDNOW = 1.5*PI + ATAN(  UYNOW / ABS(UXNOW) )
+ENDIF
+
+WSNOW = SQRT(UXNOW*UXNOW + UYNOW*UYNOW)
+   
+WDNOW = WDNOW * 180. / PI
+WDNOW = WDNOW + 180. 
+IF (WDNOW .GT. 360) WDNOW = WDNOW - 360.
+
+NL%WD20_INTERP(NODE_INDEX) = WDNOW + PERTURB_WD
+IF (NL%WD20_INTERP(NODE_INDEX) .GT. 360.) NL%WD20_INTERP(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX) - 360.
+IF (NL%WD20_INTERP(NODE_INDEX) .LT.   0.) NL%WD20_INTERP(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX) + 360.
+NL%WD20_NOW(NODE_INDEX) = NL%WD20_INTERP(NODE_INDEX)
+
+NL%WS20_INTERP(NODE_INDEX) = MAX(WSNOW + PERTURB_WS, 0.0)
+NL%WS20_NOW(NODE_INDEX) = NL%WS20_INTERP(NODE_INDEX)
+NL%WSMF(NODE_INDEX) = NL%WS20_NOW(NODE_INDEX) * MAX((WAF%R4(NL%IX(NODE_INDEX),NL%IY(NODE_INDEX),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+   
+! *****************************************************************************
+END SUBROUTINE INTERP_WIND_SINGLE_BILINEAR_NL
 ! *****************************************************************************
 
 ! *****************************************************************************
@@ -900,6 +1305,61 @@ END FUNCTION ICOL_FINE_TO_COARSE
 ! *****************************************************************************
 
 ! *****************************************************************************
+SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE_NL(NL,NODE_INDEX,LO,HI,F,IQUANTITY) ! List of nodes version of INTERP_RASTER_LINKEDLIST_SINGLE
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: NL
+INTEGER, INTENT(IN) :: NODE_INDEX
+REAL, DIMENSION(:,:), INTENT(IN) :: LO,HI
+INTEGER, INTENT(IN) :: IQUANTITY
+REAL, INTENT(IN) :: F
+INTEGER :: ICOL,IROW
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+
+!C => NODEIN
+ICOL = ICOL_ANALYSIS_F2C(NL%IX(NODE_INDEX))
+IROW = IROW_ANALYSIS_F2C(NL%IY(NODE_INDEX))
+
+SELECT CASE (IQUANTITY)
+
+   CASE (1)
+      NL%M1(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%M1(NODE_INDEX) = MAX(NL%M1(NODE_INDEX) + PERTURB_M1, 0.01)
+
+   CASE (2)
+      NL%M10(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%M10(NODE_INDEX) = MAX(NL%M10(NODE_INDEX) + PERTURB_M10, 0.01)
+
+   CASE (3)
+      NL%M100(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%M100(NODE_INDEX) = MAX(NL%M100(NODE_INDEX) + PERTURB_M100, 0.01)
+
+   CASE (4)
+      NL%MLH(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%MLH(NODE_INDEX) = MAX(NL%MLH(NODE_INDEX) + PERTURB_MLH, 0.3)
+
+   CASE (5)
+      NL%MLW(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%MLW(NODE_INDEX) = MAX(NL%MLW(NODE_INDEX) + PERTURB_MLW, 0.6)
+
+   CASE (6)
+      NL%FMC(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%FMC(NODE_INDEX) = NL%FMC(NODE_INDEX) + PERTURB_FMC
+
+   CASE (7)
+      NL%WS20_INTERP(NODE_INDEX) = LO(ICOL,IROW) + F * (HI(ICOL,IROW) - LO(ICOL,IROW) )
+      NL%WS20_INTERP(NODE_INDEX) = MAX(NL%WS20_INTERP(NODE_INDEX) + PERTURB_WS, 0.0)
+      NL%WS20_NOW(NODE_INDEX) = NL%WS20_INTERP(NODE_INDEX)
+      NL%WSMF(NODE_INDEX) = NL%WS20_NOW(NODE_INDEX) * MAX((WAF%R4(NL%IX(NODE_INDEX),NL%IY(NODE_INDEX),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+
+END SELECT
+
+! *****************************************************************************
+END SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE_NL
+! *****************************************************************************
+
+! *****************************************************************************
 SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE(NODEIN,LO,HI,F,IQUANTITY)
 ! *****************************************************************************
 
@@ -1002,6 +1462,89 @@ END SELECT
 
 ! *****************************************************************************
 END SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE_BILINEAR
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE_BILINEAR_NL( NL, NODE_INDEX, LO, HI, F, IQUANTITY) ! List of nodes version
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: NL
+INTEGER, INTENT(IN) :: NODE_INDEX
+REAL, DIMENSION(:,:), INTENT(IN) :: LO,HI
+INTEGER, INTENT(IN) :: IQUANTITY
+REAL, INTENT(IN) :: F
+!TYPE(NODE), POINTER :: C
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+REAL :: X1, X2, Y1, Y2, CX, CY, PL, PH, PNOW
+REAL :: Q11L, Q21L, Q12L, Q22L, Q11H, Q21H, Q12H, Q22H
+INTEGER :: I1, I2, J1, J2
+
+!C => NODEIN
+
+CALL GET_BILINEAR_INTERPOLATE_COEFFS(NL%IX(NODE_INDEX), NL%IY(NODE_INDEX), X1, Y1, X2, Y2, I1, J1, I2, J2, CX, CY)
+
+Q12L = LO(I1, J2) ; Q22L = LO(I2, J2)
+Q11L = LO(I1, J1) ; Q21L = LO(I2, J1)
+PL   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, Q11L, Q21L, Q12L, Q22L)
+         
+Q12H = HI(I1, J2) ; Q22H = HI(I2, J2)
+Q11H = HI(I1, J1) ; Q21H = HI(I2, J1)
+PH   = BILINEAR_INTERPOLATE(CX, CY, X1, Y1, X2, Y2, Q11H, Q21H, Q12H, Q22H)
+   
+PNOW = PL + F * (PH - PL)
+
+SELECT CASE (IQUANTITY)
+   CASE (1)
+      NL%M1(NODE_INDEX)   = MAX(PNOW + PERTURB_M1  , 0.01)
+   CASE (2)
+      NL%M10(NODE_INDEX)  = MAX(PNOW + PERTURB_M10 , 0.01)
+   CASE (3)
+      NL%M100(NODE_INDEX) = MAX(PNOW + PERTURB_M100, 0.01)
+   CASE (4)
+      NL%MLH(NODE_INDEX)  = MAX(PNOW + PERTURB_MLH , 0.30)
+   CASE (5)
+      NL%MLW(NODE_INDEX)  = MAX(PNOW + PERTURB_MLW , 0.60)
+   CASE (6)
+      NL%FMC(NODE_INDEX)  = PNOW + PERTURB_FMC
+   CASE (7)
+      NL%WS20_INTERP(NODE_INDEX) = MAX(PNOW + PERTURB_WS, 0.0)
+      NL%WS20_NOW(NODE_INDEX) = NL%WS20_INTERP(NODE_INDEX)
+      NL%WSMF(NODE_INDEX) = NL%WS20_NOW(NODE_INDEX) * MAX((WAF%R4(NL%IX(NODE_INDEX),NL%IY(NODE_INDEX),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+END SELECT
+
+! *****************************************************************************
+END SUBROUTINE INTERP_RASTER_LINKEDLIST_SINGLE_BILINEAR_NL
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE APPLY_WIND_FLUCTUATIONS_NL(NL) ! List of nodes version to apply wind fluctuations
+! *****************************************************************************
+
+TYPE (NODE_LIST), INTENT(INOUT) :: NL
+!TYPE(NODE), POINTER :: C
+INTEGER :: I
+REAL :: FAC1, FAC2, R2(1:2)
+REAL, PARAMETER :: CONVERSION_FACTOR = 5280./60.
+
+CALL RANDOM_NUMBER(R2)
+R2(1) = WIND_SPEED_FLUCTUATION_INTENSITY     * (R2(1) - 0.5)
+R2(2) = WIND_DIRECTION_FLUCTUATION_INTENSITY * (R2(2) - 0.5)
+
+FAC1 = 1. + R2(1)
+FAC2 = R2(2) * 360.
+
+!C => NL%HEAD
+DO I = 1, NL%NUM_NODES
+   NL%WS20_NOW(I) = FAC1 * NL%WS20_INTERP(I)
+   NL%WSMF(I) = NL%WS20_NOW(I) * MAX((WAF%R4(NL%IX(I),NL%IY(I),1) + PERTURB_WAF),0.) * CONVERSION_FACTOR
+   NL%WD20_NOW(I) = NL%WD20_INTERP(I) + FAC2
+   IF (NL%WD20_NOW(I) .GT. 360.) NL%WD20_NOW(I) = NL%WD20_NOW(I) - 360.
+   IF (NL%WD20_NOW(I) .LT.   0.) NL%WD20_NOW(I) = NL%WD20_NOW(I) + 360.
+   !C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE APPLY_WIND_FLUCTUATIONS_NL
 ! *****************************************************************************
 
 ! *****************************************************************************
@@ -1114,6 +1657,7 @@ INTEGER, INTENT(IN) :: N_ROWS
 REAL, ALLOCATABLE, INTENT(INOUT), DIMENSION(:,:) :: DYNAMIC_ARRAY
 
 ! Remove the copy and paste part of the code that appends to the dynamic array, to improve performance.
+! It uses more memory, because it creates an array with a fixed size, but is faster than the previous version.
 DYNAMIC_ARRAY(N_ROWS, 1) = REAL(IX)
 DYNAMIC_ARRAY(N_ROWS, 2) = REAL(IY)
 
@@ -1143,6 +1687,740 @@ DL2%NUM_NODES = 1
 
 ! *****************************************************************************
 END SUBROUTINE INIT
+! *****************************************************************************
+ 
+! *****************************************************************************
+SUBROUTINE INIT_NODE_LIST(NL, N) ! Allocates all of the lists in node list with n nodes to allocate
+! *****************************************************************************
+   TYPE(NODE_LIST), INTENT(INOUT) :: NL ! Node list to initialize
+   INTEGER, INTENT(IN) :: N ! Number of nodes to allocate
+   IF (ALLOCATED(NL%IX)) RETURN ! Already initialized; arrays persist across calls
+   NL%NUM_NODES = 0
+   ALLOCATE(NL%CROWN_FIRE(N));            NL%CROWN_FIRE = 0
+   ALLOCATE(NL%IX(N));                    NL%IX = -1
+   ALLOCATE(NL%IY(N));                    NL%IY = -1
+   ALLOCATE(NL%BURNED(N));                NL%BURNED = .FALSE.
+   ALLOCATE(NL%JUST_TAGGED(N));           NL%JUST_TAGGED = .TRUE.
+   ALLOCATE(NL%CRITICAL_FLIN(N));         NL%CRITICAL_FLIN = 9E9
+   ALLOCATE(NL%DPHIDX_LIMITED(N));        NL%DPHIDX_LIMITED = 0.
+   ALLOCATE(NL%DPHIDY_LIMITED(N));        NL%DPHIDY_LIMITED = 0.
+   ALLOCATE(NL%FLAME_LENGTH(N));          NL%FLAME_LENGTH = 0.
+   ALLOCATE(NL%FLIN_CANOPY(N));           NL%FLIN_CANOPY = 0.
+   ALLOCATE(NL%FLIN_DMS_SURFACE(N));      NL%FLIN_DMS_SURFACE = 0.
+   ALLOCATE(NL%FLIN_SURFACE(N));          NL%FLIN_SURFACE = 0.
+   ALLOCATE(NL%FMC(N));                   NL%FMC = 0.
+   ALLOCATE(NL%HPUA_CANOPY(N));           NL%HPUA_CANOPY = 0.
+   ALLOCATE(NL%HPUA_SURFACE(N));           NL%HPUA_SURFACE = 0.
+   ALLOCATE(NL%IR(N));                    NL%IR = 0.
+   ALLOCATE(NL%M1(N));                    NL%M1 = 0.
+   ALLOCATE(NL%M10(N));                   NL%M10 = 0.
+   ALLOCATE(NL%M100(N));                  NL%M100 = 0.
+   ALLOCATE(NL%MLH(N));                   NL%MLH = 0.
+   ALLOCATE(NL%MLW(N));                   NL%MLW = 0.
+   ALLOCATE(NL%NORMVECTORX(N));           NL%NORMVECTORX = 0.
+   ALLOCATE(NL%NORMVECTORY(N));           NL%NORMVECTORY = 0.
+   ALLOCATE(NL%PHIS_SURFACE(N));          NL%PHIS_SURFACE = 0.
+   ALLOCATE(NL%PHIW_CROWN(N));            NL%PHIW_CROWN = 0.
+   ALLOCATE(NL%PHIW_SURFACE(N));          NL%PHIW_SURFACE = 0.
+   ALLOCATE(NL%TIME_ADDED(N));            NL%TIME_ADDED = -1.0
+   ALLOCATE(NL%TIME_OF_ARRIVAL(N));       NL%TIME_OF_ARRIVAL = -1.0
+   ALLOCATE(NL%UX(N));                    NL%UX = 0.
+   ALLOCATE(NL%UY(N));                    NL%UY = 0.
+   ALLOCATE(NL%VELOCITY(N));              NL%VELOCITY = 0.
+   ALLOCATE(NL%VELOCITY_DMS(N));          NL%VELOCITY_DMS = 0.
+   ALLOCATE(NL%VS0(N));                   NL%VS0 = 0.
+   ALLOCATE(NL%WD20_INTERP(N));            NL%WD20_INTERP = 0.
+   ALLOCATE(NL%WD20_NOW(N));               NL%WD20_NOW = 0.
+   ALLOCATE(NL%WS20_INTERP(N));            NL%WS20_INTERP = 0.
+   ALLOCATE(NL%WS20_NOW(N));               NL%WS20_NOW = 0.
+   ALLOCATE(NL%WSMF(N));                   NL%WSMF = 0.
+   ALLOCATE(NL%VELOCITY_DMS_SURFACE(N));   NL%VELOCITY_DMS_SURFACE = 0.
+   ALLOCATE(NL%NEED_SLOPE_CALC(N));       NL%NEED_SLOPE_CALC = .TRUE.
+   ALLOCATE(NL%PHISX(N));                 NL%PHISX = -9999.
+   ALLOCATE(NL%PHISY(N));                 NL%PHISY = -9999.
+   ALLOCATE(NL%UXOUSX(N));                NL%UXOUSX = -9999.
+   ALLOCATE(NL%UYOUSY(N));                NL%UYOUSY = -9999.
+   ALLOCATE(NL%NORMVECTORX_DMS(N));       NL%NORMVECTORX_DMS = -9999.
+   ALLOCATE(NL%NORMVECTORY_DMS(N));       NL%NORMVECTORY_DMS = -9999.
+   ALLOCATE(NL%VBACK(N));                 NL%VBACK = -9999.
+   ALLOCATE(NL%LOW(N));                   NL%LOW = -9999.
+   ALLOCATE(NL%IFBFM(N));                 NL%IFBFM = 0
+   ALLOCATE(NL%ADJ(N));                   NL%ADJ = 0.
+   ALLOCATE(NL%TANSLP2(N));               NL%TANSLP2 = 0.
+   ALLOCATE(NL%PHIP_OLD(N));              NL%PHIP_OLD = 0.
+   ALLOCATE(NL%DUMPME(N));                NL%DUMPME = 0.
+   ALLOCATE(NL%HRRPUA(N));                NL%HRRPUA = 0.
+   ALLOCATE(NL%TIME_SUPPRESSED(N));        NL%TIME_SUPPRESSED = -1.0
+#ifdef _SUPPRESSION
+   ALLOCATE(NL%SUPPRESSION_ADJUSTMENT_FACTOR(N)); NL%SUPPRESSION_ADJUSTMENT_FACTOR = 1.0
+   ALLOCATE(NL%SUPPRESSION_IDEG(N));              NL%SUPPRESSION_IDEG = 9999
+   ALLOCATE(NL%SDI(N));                           NL%SDI = 0.
+#endif
+#ifdef _SMOKE
+   ALLOCATE(NL%TIME_IGNITED(N));           NL%TIME_IGNITED = 0.
+   ALLOCATE(NL%TIME_EXTINGUISHED(N));      NL%TIME_EXTINGUISHED = 0.
+   ALLOCATE(NL%SMOKE_TFRAC(N));            NL%SMOKE_TFRAC = 0.
+   ALLOCATE(NL%QDOT_AVG(N));               NL%QDOT_AVG = 0.
+#endif
+#ifdef _WUI
+   ALLOCATE(NL%ELLIPSE_PARAMETERS(N))
+   ALLOCATE(NL%BLDG_FUEL_MODEL(N));        NL%BLDG_FUEL_MODEL = 0
+   ALLOCATE(NL%IBLDGFM(N));                NL%IBLDGFM = 1
+   ALLOCATE(NL%SIGN_X(N));                 NL%SIGN_X = 1
+   ALLOCATE(NL%SIGN_Y(N));                 NL%SIGN_Y = 1
+   ALLOCATE(NL%BLDG_AREA(N));              NL%BLDG_AREA = 0.
+   ALLOCATE(NL%BLDG_NONBURNABLE_FRAC(N));  NL%BLDG_NONBURNABLE_FRAC = 0.
+   ALLOCATE(NL%BLDG_SEPARATION_DIST(N));   NL%BLDG_SEPARATION_DIST = 0.
+   ALLOCATE(NL%BLDG_FOOTPRINT_FRAC(N));    NL%BLDG_FOOTPRINT_FRAC = 0.
+   ALLOCATE(NL%RAD_DIST(N));               NL%RAD_DIST = 100.
+   ALLOCATE(NL%WIND_PROP(N));              NL%WIND_PROP = 1.
+   ALLOCATE(NL%HEAT_VALUE(N));             NL%HEAT_VALUE = 0.
+   ALLOCATE(NL%HRR_TRANSIENT(N));          NL%HRR_TRANSIENT = 0.
+   ALLOCATE(NL%ABSOLUTE_U(N));             NL%ABSOLUTE_U = 0.
+   ALLOCATE(NL%TOTAL_DFC_RECEIVED(N));     NL%TOTAL_DFC_RECEIVED = 0.
+   ALLOCATE(NL%TOTAL_RAD_RECEIVED(N));     NL%TOTAL_RAD_RECEIVED = 0.
+#endif
+#ifdef _UMDSPOTTING
+   ALLOCATE(NL%TAU_EMBERGEN(N));           NL%TAU_EMBERGEN = 0.
+   ALLOCATE(NL%LOCAL_EMBERGEN_DURATION(N)); NL%LOCAL_EMBERGEN_DURATION = 0.
+   ALLOCATE(NL%T_START_SPOTTING(N));        NL%T_START_SPOTTING = -1.
+   ALLOCATE(NL%T_END_SPOTTING(N));          NL%T_END_SPOTTING = -1.
+#endif
+! *****************************************************************************
+END SUBROUTINE INIT_NODE_LIST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE FREE_NODE_LIST(NL) ! Deallocates all lists
+! *****************************************************************************
+   TYPE(NODE_LIST), INTENT(INOUT) :: NL
+   NL%NUM_NODES = 0
+   IF (ALLOCATED(NL%CROWN_FIRE))             DEALLOCATE(NL%CROWN_FIRE)
+   IF (ALLOCATED(NL%IX))                     DEALLOCATE(NL%IX)
+   IF (ALLOCATED(NL%IY))                     DEALLOCATE(NL%IY)
+   IF (ALLOCATED(NL%BURNED))                 DEALLOCATE(NL%BURNED)
+   IF (ALLOCATED(NL%JUST_TAGGED))            DEALLOCATE(NL%JUST_TAGGED)
+   IF (ALLOCATED(NL%CRITICAL_FLIN))          DEALLOCATE(NL%CRITICAL_FLIN)
+   IF (ALLOCATED(NL%DPHIDX_LIMITED))         DEALLOCATE(NL%DPHIDX_LIMITED)
+   IF (ALLOCATED(NL%DPHIDY_LIMITED))         DEALLOCATE(NL%DPHIDY_LIMITED)
+   IF (ALLOCATED(NL%FLAME_LENGTH))           DEALLOCATE(NL%FLAME_LENGTH)
+   IF (ALLOCATED(NL%FLIN_CANOPY))            DEALLOCATE(NL%FLIN_CANOPY)
+   IF (ALLOCATED(NL%FLIN_DMS_SURFACE))       DEALLOCATE(NL%FLIN_DMS_SURFACE)
+   IF (ALLOCATED(NL%FLIN_SURFACE))           DEALLOCATE(NL%FLIN_SURFACE)
+   IF (ALLOCATED(NL%FMC))                    DEALLOCATE(NL%FMC)
+   IF (ALLOCATED(NL%HPUA_CANOPY))            DEALLOCATE(NL%HPUA_CANOPY)
+   IF (ALLOCATED(NL%HPUA_SURFACE))          DEALLOCATE(NL%HPUA_SURFACE)
+   IF (ALLOCATED(NL%IR))                    DEALLOCATE(NL%IR)
+   IF (ALLOCATED(NL%M1))                    DEALLOCATE(NL%M1)
+   IF (ALLOCATED(NL%M10))                   DEALLOCATE(NL%M10)
+   IF (ALLOCATED(NL%M100))                  DEALLOCATE(NL%M100)
+   IF (ALLOCATED(NL%MLH))                   DEALLOCATE(NL%MLH)
+   IF (ALLOCATED(NL%MLW))                   DEALLOCATE(NL%MLW)
+   IF (ALLOCATED(NL%NORMVECTORX))           DEALLOCATE(NL%NORMVECTORX)
+   IF (ALLOCATED(NL%NORMVECTORY))           DEALLOCATE(NL%NORMVECTORY)
+   IF (ALLOCATED(NL%PHIS_SURFACE))          DEALLOCATE(NL%PHIS_SURFACE)
+   IF (ALLOCATED(NL%PHIW_CROWN))            DEALLOCATE(NL%PHIW_CROWN)
+   IF (ALLOCATED(NL%PHIW_SURFACE))          DEALLOCATE(NL%PHIW_SURFACE)
+   IF (ALLOCATED(NL%TIME_ADDED))            DEALLOCATE(NL%TIME_ADDED)
+   IF (ALLOCATED(NL%TIME_OF_ARRIVAL))       DEALLOCATE(NL%TIME_OF_ARRIVAL)
+   IF (ALLOCATED(NL%UX))                    DEALLOCATE(NL%UX)
+   IF (ALLOCATED(NL%UY))                    DEALLOCATE(NL%UY)
+   IF (ALLOCATED(NL%VELOCITY))              DEALLOCATE(NL%VELOCITY)
+   IF (ALLOCATED(NL%VELOCITY_DMS))          DEALLOCATE(NL%VELOCITY_DMS)
+   IF (ALLOCATED(NL%VS0))                   DEALLOCATE(NL%VS0)
+   IF (ALLOCATED(NL%WD20_INTERP))            DEALLOCATE(NL%WD20_INTERP)
+   IF (ALLOCATED(NL%WD20_NOW))               DEALLOCATE(NL%WD20_NOW)
+   IF (ALLOCATED(NL%WS20_INTERP))            DEALLOCATE(NL%WS20_INTERP)
+   IF (ALLOCATED(NL%WS20_NOW))               DEALLOCATE(NL%WS20_NOW)
+   IF (ALLOCATED(NL%WSMF))                   DEALLOCATE(NL%WSMF)
+   IF (ALLOCATED(NL%VELOCITY_DMS_SURFACE))   DEALLOCATE(NL%VELOCITY_DMS_SURFACE)
+   IF (ALLOCATED(NL%NEED_SLOPE_CALC))       DEALLOCATE(NL%NEED_SLOPE_CALC)
+   IF (ALLOCATED(NL%PHISX))                 DEALLOCATE(NL%PHISX)
+   IF (ALLOCATED(NL%PHISY))                 DEALLOCATE(NL%PHISY)
+   IF (ALLOCATED(NL%UXOUSX))                DEALLOCATE(NL%UXOUSX)
+   IF (ALLOCATED(NL%UYOUSY))                DEALLOCATE(NL%UYOUSY)
+   IF (ALLOCATED(NL%NORMVECTORX_DMS))       DEALLOCATE(NL%NORMVECTORX_DMS)
+   IF (ALLOCATED(NL%NORMVECTORY_DMS))       DEALLOCATE(NL%NORMVECTORY_DMS)
+   IF (ALLOCATED(NL%VBACK))                 DEALLOCATE(NL%VBACK)
+   IF (ALLOCATED(NL%LOW))                   DEALLOCATE(NL%LOW)
+   IF (ALLOCATED(NL%IFBFM))                 DEALLOCATE(NL%IFBFM)
+   IF (ALLOCATED(NL%ADJ))                   DEALLOCATE(NL%ADJ)
+   IF (ALLOCATED(NL%TANSLP2))               DEALLOCATE(NL%TANSLP2)
+   IF (ALLOCATED(NL%PHIP_OLD))              DEALLOCATE(NL%PHIP_OLD)
+   IF (ALLOCATED(NL%DUMPME))                DEALLOCATE(NL%DUMPME)
+   IF (ALLOCATED(NL%HRRPUA))                DEALLOCATE(NL%HRRPUA)
+   IF (ALLOCATED(NL%TIME_SUPPRESSED))       DEALLOCATE(NL%TIME_SUPPRESSED)
+#ifdef _SUPPRESSION
+   IF (ALLOCATED(NL%SUPPRESSION_ADJUSTMENT_FACTOR)) DEALLOCATE(NL%SUPPRESSION_ADJUSTMENT_FACTOR)
+   IF (ALLOCATED(NL%SUPPRESSION_IDEG))              DEALLOCATE(NL%SUPPRESSION_IDEG)
+   IF (ALLOCATED(NL%SDI))                           DEALLOCATE(NL%SDI)
+#endif
+#ifdef _SMOKE
+   IF (ALLOCATED(NL%TIME_IGNITED))           DEALLOCATE(NL%TIME_IGNITED)
+   IF (ALLOCATED(NL%TIME_EXTINGUISHED))      DEALLOCATE(NL%TIME_EXTINGUISHED)
+   IF (ALLOCATED(NL%SMOKE_TFRAC))            DEALLOCATE(NL%SMOKE_TFRAC)
+   IF (ALLOCATED(NL%QDOT_AVG))               DEALLOCATE(NL%QDOT_AVG)
+#endif
+#ifdef _WUI
+   IF (ALLOCATED(NL%ELLIPSE_PARAMETERS))     DEALLOCATE(NL%ELLIPSE_PARAMETERS)
+   IF (ALLOCATED(NL%BLDG_FUEL_MODEL))        DEALLOCATE(NL%BLDG_FUEL_MODEL)
+   IF (ALLOCATED(NL%IBLDGFM))                DEALLOCATE(NL%IBLDGFM)
+   IF (ALLOCATED(NL%SIGN_X))                 DEALLOCATE(NL%SIGN_X)
+   IF (ALLOCATED(NL%SIGN_Y))                 DEALLOCATE(NL%SIGN_Y)
+   IF (ALLOCATED(NL%BLDG_AREA))              DEALLOCATE(NL%BLDG_AREA)
+   IF (ALLOCATED(NL%BLDG_NONBURNABLE_FRAC))  DEALLOCATE(NL%BLDG_NONBURNABLE_FRAC)
+   IF (ALLOCATED(NL%BLDG_SEPARATION_DIST))   DEALLOCATE(NL%BLDG_SEPARATION_DIST)
+   IF (ALLOCATED(NL%BLDG_FOOTPRINT_FRAC))    DEALLOCATE(NL%BLDG_FOOTPRINT_FRAC)
+   IF (ALLOCATED(NL%RAD_DIST))               DEALLOCATE(NL%RAD_DIST)
+   IF (ALLOCATED(NL%WIND_PROP))              DEALLOCATE(NL%WIND_PROP)
+   IF (ALLOCATED(NL%HEAT_VALUE))             DEALLOCATE(NL%HEAT_VALUE)
+   IF (ALLOCATED(NL%HRR_TRANSIENT))          DEALLOCATE(NL%HRR_TRANSIENT)
+   IF (ALLOCATED(NL%ABSOLUTE_U))             DEALLOCATE(NL%ABSOLUTE_U)
+   IF (ALLOCATED(NL%TOTAL_DFC_RECEIVED))     DEALLOCATE(NL%TOTAL_DFC_RECEIVED)
+   IF (ALLOCATED(NL%TOTAL_RAD_RECEIVED))     DEALLOCATE(NL%TOTAL_RAD_RECEIVED)
+#endif
+#ifdef _UMDSPOTTING
+   IF (ALLOCATED(NL%TAU_EMBERGEN))           DEALLOCATE(NL%TAU_EMBERGEN)
+   IF (ALLOCATED(NL%LOCAL_EMBERGEN_DURATION)) DEALLOCATE(NL%LOCAL_EMBERGEN_DURATION)
+   IF (ALLOCATED(NL%T_START_SPOTTING))       DEALLOCATE(NL%T_START_SPOTTING)
+   IF (ALLOCATED(NL%T_END_SPOTTING))         DEALLOCATE(NL%T_END_SPOTTING)
+#endif
+! *****************************************************************************
+END SUBROUTINE FREE_NODE_LIST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE COPY_NODE_TO_LIST(NL, IX, IY, T) ! Same function as APPEND but for the new node list
+! *****************************************************************************
+   TYPE(NODE_LIST), INTENT(INOUT) :: NL ! Node list
+   INTEGER, INTENT(IN) :: IX, IY
+   REAL, INTENT(IN) :: T
+   INTEGER :: N
+
+   NL%NUM_NODES = NL%NUM_NODES + 1
+   N = NL%NUM_NODES
+
+   NL%IX(N)         = IX
+   NL%IY(N)         = IY
+   NL%TIME_ADDED(N) = T
+   NL%IFBFM(N)      = FBFM%I2(IX, IY, 1)
+   NL%ADJ(N)        = ADJ%R4(IX, IY, 1)
+   NL%TANSLP2(N)    = TANSLP2(MAX(MIN(NINT(SLP%R4(IX, IY, 1)), 90), 0))
+   NL%WD20_NOW(N)   = WD%R4(IX, IY, 1)
+   NL%WS20_NOW(N)   = WS%R4(IX, IY, 1)
+
+#ifdef _WUI
+   IF (USE_BLDG_SPREAD_MODEL) THEN
+      NL%IBLDGFM(N)     = BLDG_FUEL_MODEL%I2(IX, IY, 1)
+      NL%BLDG_AREA(N)   = BLDG_AREA%R4(IX, IY, 1)
+      NL%BLDG_NONBURNABLE_FRAC(N) = BLDG_NONBURNABLE_FRAC%R4(IX, IY, 1)
+      NL%BLDG_SEPARATION_DIST(N) = BLDG_SEPARATION_DIST%R4(IX, IY, 1)
+      NL%BLDG_FOOTPRINT_FRAC(N)   = BLDG_FOOTPRINT_FRAC%R4(IX, IY, 1)
+   ENDIF
+#endif
+
+#ifdef _UMDSPOTTING
+   NL%TAU_EMBERGEN(N) = 0.
+#endif
+! *****************************************************************************
+END SUBROUTINE COPY_NODE_TO_LIST
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE DELETE_NODE_NL(NL, INDEX) ! Deletes a node from the list of nodes by index
+! *****************************************************************************
+   TYPE(NODE_LIST), INTENT(INOUT) :: NL
+   INTEGER, INTENT(IN) :: INDEX
+   INTEGER :: LAST
+
+   LAST = NL%NUM_NODES
+
+   IF (NL%NUM_NODES .EQ. 0) RETURN ! Check if the list is empty
+   IF (INDEX .LT. 1 .OR. INDEX .GT. LAST) RETURN ! Chek if the index is valid
+
+   ! It simply copies the last node to the index to delete, and then decrements the number of nodes. 
+   ! This is faster than shifting all nodes after the deleted one.
+   ! Will not preserve the order but will test if order matters anywhere
+   IF (INDEX .NE. LAST) THEN 
+      NL%CROWN_FIRE(INDEX)        = NL%CROWN_FIRE(LAST)
+      NL%IX(INDEX)                = NL%IX(LAST)
+      NL%IY(INDEX)                = NL%IY(LAST)
+      NL%BURNED(INDEX)            = NL%BURNED(LAST)
+      NL%JUST_TAGGED(INDEX)       = NL%JUST_TAGGED(LAST)
+      NL%CRITICAL_FLIN(INDEX)     = NL%CRITICAL_FLIN(LAST)
+      NL%DPHIDX_LIMITED(INDEX)    = NL%DPHIDX_LIMITED(LAST)
+      NL%DPHIDY_LIMITED(INDEX)    = NL%DPHIDY_LIMITED(LAST)
+      NL%FLAME_LENGTH(INDEX)      = NL%FLAME_LENGTH(LAST)
+      NL%FLIN_CANOPY(INDEX)       = NL%FLIN_CANOPY(LAST)
+      NL%FLIN_DMS_SURFACE(INDEX)  = NL%FLIN_DMS_SURFACE(LAST)
+      NL%FLIN_SURFACE(INDEX)      = NL%FLIN_SURFACE(LAST)
+      NL%FMC(INDEX)               = NL%FMC(LAST)
+      NL%HPUA_CANOPY(INDEX)       = NL%HPUA_CANOPY(LAST)
+      NL%HPUA_SURFACE(INDEX)      = NL%HPUA_SURFACE(LAST)
+      NL%IR(INDEX)                = NL%IR(LAST)
+      NL%M1(INDEX)                = NL%M1(LAST)
+      NL%M10(INDEX)               = NL%M10(LAST)
+      NL%M100(INDEX)              = NL%M100(LAST)
+      NL%MLH(INDEX)               = NL%MLH(LAST)
+      NL%MLW(INDEX)               = NL%MLW(LAST)
+      NL%NORMVECTORX(INDEX)       = NL%NORMVECTORX(LAST)
+      NL%NORMVECTORY(INDEX)       = NL%NORMVECTORY(LAST)
+      NL%PHIS_SURFACE(INDEX)      = NL%PHIS_SURFACE(LAST)
+      NL%PHIW_CROWN(INDEX)        = NL%PHIW_CROWN(LAST)
+      NL%PHIW_SURFACE(INDEX)      = NL%PHIW_SURFACE(LAST)
+      NL%TIME_ADDED(INDEX)        = NL%TIME_ADDED(LAST)
+      NL%TIME_OF_ARRIVAL(INDEX)   = NL%TIME_OF_ARRIVAL(LAST)
+      NL%UX(INDEX)                = NL%UX(LAST)
+      NL%UY(INDEX)                = NL%UY(LAST)
+      NL%VELOCITY(INDEX)          = NL%VELOCITY(LAST)
+      NL%VELOCITY_DMS(INDEX)         = NL%VELOCITY_DMS(LAST)
+      NL%VS0(INDEX)                  = NL%VS0(LAST)
+      NL%WD20_INTERP(INDEX)          = NL%WD20_INTERP(LAST)
+      NL%WD20_NOW(INDEX)             = NL%WD20_NOW(LAST)
+      NL%WS20_INTERP(INDEX)          = NL%WS20_INTERP(LAST)
+      NL%WS20_NOW(INDEX)             = NL%WS20_NOW(LAST)
+      NL%WSMF(INDEX)                 = NL%WSMF(LAST)
+      NL%VELOCITY_DMS_SURFACE(INDEX) = NL%VELOCITY_DMS_SURFACE(LAST)
+      NL%NEED_SLOPE_CALC(INDEX)   = NL%NEED_SLOPE_CALC(LAST)
+      NL%PHISX(INDEX)             = NL%PHISX(LAST)
+      NL%PHISY(INDEX)             = NL%PHISY(LAST)
+      NL%UXOUSX(INDEX)            = NL%UXOUSX(LAST)
+      NL%UYOUSY(INDEX)            = NL%UYOUSY(LAST)
+      NL%NORMVECTORX_DMS(INDEX)   = NL%NORMVECTORX_DMS(LAST)
+      NL%NORMVECTORY_DMS(INDEX)   = NL%NORMVECTORY_DMS(LAST)
+      NL%VBACK(INDEX)             = NL%VBACK(LAST)
+      NL%LOW(INDEX)               = NL%LOW(LAST)
+      NL%IFBFM(INDEX)             = NL%IFBFM(LAST)
+      NL%ADJ(INDEX)               = NL%ADJ(LAST)
+      NL%TANSLP2(INDEX)           = NL%TANSLP2(LAST)
+      NL%PHIP_OLD(INDEX)          = NL%PHIP_OLD(LAST)
+      NL%DUMPME(INDEX)            = NL%DUMPME(LAST)
+      NL%HRRPUA(INDEX)            = NL%HRRPUA(LAST)
+      NL%TIME_SUPPRESSED(INDEX)   = NL%TIME_SUPPRESSED(LAST)
+#ifdef _SUPPRESSION
+      NL%SUPPRESSION_ADJUSTMENT_FACTOR(INDEX) = NL%SUPPRESSION_ADJUSTMENT_FACTOR(LAST)
+      NL%SUPPRESSION_IDEG(INDEX)              = NL%SUPPRESSION_IDEG(LAST)
+      NL%SDI(INDEX)                           = NL%SDI(LAST)
+#endif
+#ifdef _SMOKE
+      NL%TIME_IGNITED(INDEX)           = NL%TIME_IGNITED(LAST)
+      NL%TIME_EXTINGUISHED(INDEX)      = NL%TIME_EXTINGUISHED(LAST)
+      NL%SMOKE_TFRAC(INDEX)            = NL%SMOKE_TFRAC(LAST)
+      NL%QDOT_AVG(INDEX)               = NL%QDOT_AVG(LAST)
+#endif
+#ifdef _WUI
+      NL%ELLIPSE_PARAMETERS(INDEX)     = NL%ELLIPSE_PARAMETERS(LAST)
+      NL%BLDG_FUEL_MODEL(INDEX)        = NL%BLDG_FUEL_MODEL(LAST)
+      NL%IBLDGFM(INDEX)                = NL%IBLDGFM(LAST)
+      NL%SIGN_X(INDEX)                 = NL%SIGN_X(LAST)
+      NL%SIGN_Y(INDEX)                 = NL%SIGN_Y(LAST)
+      NL%BLDG_AREA(INDEX)              = NL%BLDG_AREA(LAST)
+      NL%BLDG_NONBURNABLE_FRAC(INDEX)  = NL%BLDG_NONBURNABLE_FRAC(LAST)
+      NL%BLDG_SEPARATION_DIST(INDEX)   = NL%BLDG_SEPARATION_DIST(LAST)
+      NL%BLDG_FOOTPRINT_FRAC(INDEX)    = NL%BLDG_FOOTPRINT_FRAC(LAST)
+      NL%RAD_DIST(INDEX)               = NL%RAD_DIST(LAST)
+      NL%WIND_PROP(INDEX)              = NL%WIND_PROP(LAST)
+      NL%HEAT_VALUE(INDEX)             = NL%HEAT_VALUE(LAST)
+      NL%HRR_TRANSIENT(INDEX)          = NL%HRR_TRANSIENT(LAST)
+      NL%ABSOLUTE_U(INDEX)             = NL%ABSOLUTE_U(LAST)
+      NL%TOTAL_DFC_RECEIVED(INDEX)     = NL%TOTAL_DFC_RECEIVED(LAST)
+      NL%TOTAL_RAD_RECEIVED(INDEX)     = NL%TOTAL_RAD_RECEIVED(LAST)
+#endif
+#ifdef _UMDSPOTTING
+      NL%TAU_EMBERGEN(INDEX)           = NL%TAU_EMBERGEN(LAST)
+      NL%LOCAL_EMBERGEN_DURATION(INDEX) = NL%LOCAL_EMBERGEN_DURATION(LAST)
+      NL%T_START_SPOTTING(INDEX)        = NL%T_START_SPOTTING(LAST)
+      NL%T_END_SPOTTING(INDEX)          = NL%T_END_SPOTTING(LAST)
+#endif
+   ENDIF
+
+   NL%NUM_NODES = NL%NUM_NODES - 1
+
+! *****************************************************************************
+END SUBROUTINE DELETE_NODE_NL
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_DLL_NODE_TO_SOA_TAGGED(C, NL, IDX)
+! *****************************************************************************
+! Full slot sync for tagged list after UNTAG_CELLS.
+
+TYPE(NODE), INTENT(IN) :: C
+TYPE(NODE_LIST), INTENT(INOUT) :: NL
+INTEGER, INTENT(IN) :: IDX
+
+   NL%CROWN_FIRE(IDX) = C%CROWN_FIRE
+   NL%IX(IDX) = C%IX
+   NL%IY(IDX) = C%IY
+   NL%BURNED(IDX) = C%BURNED
+   NL%JUST_TAGGED(IDX) = C%JUST_TAGGED
+   NL%CRITICAL_FLIN(IDX) = C%CRITICAL_FLIN
+   NL%DPHIDX_LIMITED(IDX) = C%DPHIDX_LIMITED
+   NL%DPHIDY_LIMITED(IDX) = C%DPHIDY_LIMITED
+   NL%FLAME_LENGTH(IDX) = C%FLAME_LENGTH
+   NL%FLIN_CANOPY(IDX) = C%FLIN_CANOPY
+   NL%FLIN_DMS_SURFACE(IDX) = C%FLIN_DMS_SURFACE
+   NL%FLIN_SURFACE(IDX) = C%FLIN_SURFACE
+   NL%FMC(IDX) = C%FMC
+   NL%HPUA_CANOPY(IDX) = C%HPUA_CANOPY
+   NL%HPUA_SURFACE(IDX) = C%HPUA_SURFACE
+   NL%IR(IDX) = C%IR
+   NL%M1(IDX) = C%M1
+   NL%M10(IDX) = C%M10
+   NL%M100(IDX) = C%M100
+   NL%MLH(IDX) = C%MLH
+   NL%MLW(IDX) = C%MLW
+   NL%NORMVECTORX(IDX) = C%NORMVECTORX
+   NL%NORMVECTORY(IDX) = C%NORMVECTORY
+   NL%PHIS_SURFACE(IDX) = C%PHIS_SURFACE
+   NL%PHIW_CROWN(IDX) = C%PHIW_CROWN
+   NL%PHIW_SURFACE(IDX) = C%PHIW_SURFACE
+   NL%TIME_ADDED(IDX) = C%TIME_ADDED
+   NL%TIME_OF_ARRIVAL(IDX) = C%TIME_OF_ARRIVAL
+   NL%UX(IDX) = C%UX
+   NL%UY(IDX) = C%UY
+   NL%VELOCITY(IDX) = C%VELOCITY
+   NL%VELOCITY_DMS(IDX) = C%VELOCITY_DMS
+   NL%VS0(IDX) = C%VS0
+   NL%WD20_INTERP(IDX) = C%WD20_INTERP
+   NL%WD20_NOW(IDX) = C%WD20_NOW
+   NL%WS20_INTERP(IDX) = C%WS20_INTERP
+   NL%WS20_NOW(IDX) = C%WS20_NOW
+   NL%WSMF(IDX) = C%WSMF
+   NL%VELOCITY_DMS_SURFACE(IDX) = C%VELOCITY_DMS_SURFACE
+   NL%NEED_SLOPE_CALC(IDX) = C%NEED_SLOPE_CALC
+   NL%PHISX(IDX) = C%PHISX
+   NL%PHISY(IDX) = C%PHISY
+   NL%UXOUSX(IDX) = C%UXOUSX
+   NL%UYOUSY(IDX) = C%UYOUSY
+   NL%NORMVECTORX_DMS(IDX) = C%NORMVECTORX_DMS
+   NL%NORMVECTORY_DMS(IDX) = C%NORMVECTORY_DMS
+   NL%VBACK(IDX) = C%VBACK
+   NL%LOW(IDX) = C%LOW
+   NL%IFBFM(IDX) = C%IFBFM
+   NL%ADJ(IDX) = C%ADJ
+   NL%TANSLP2(IDX) = C%TANSLP2
+   NL%PHIP_OLD(IDX) = C%PHIP_OLD
+   NL%DUMPME(IDX) = C%DUMPME
+   NL%HRRPUA(IDX) = C%HRRPUA
+   NL%TIME_SUPPRESSED(IDX) = C%TIME_SUPPRESSED
+#ifdef _SUPPRESSION
+   NL%SUPPRESSION_ADJUSTMENT_FACTOR(IDX) = C%SUPPRESSION_ADJUSTMENT_FACTOR
+   NL%SUPPRESSION_IDEG(IDX) = C%SUPPRESSION_IDEG
+   NL%SDI(IDX) = C%SDI
+#endif
+#ifdef _SMOKE
+   NL%TIME_IGNITED(IDX) = C%TIME_IGNITED
+   NL%TIME_EXTINGUISHED(IDX) = C%TIME_EXTINGUISHED
+   NL%SMOKE_TFRAC(IDX) = C%SMOKE_TFRAC
+   NL%QDOT_AVG(IDX) = C%QDOT_AVG
+#endif
+#ifdef _WUI
+   NL%BLDG_FUEL_MODEL(IDX) = C%BLDG_FUEL_MODEL
+   NL%IBLDGFM(IDX) = C%IBLDGFM
+   NL%SIGN_X(IDX) = C%SIGN_X
+   NL%SIGN_Y(IDX) = C%SIGN_Y
+   NL%BLDG_AREA(IDX) = C%BLDG_AREA
+   NL%BLDG_NONBURNABLE_FRAC(IDX) = C%BLDG_NONBURNABLE_FRAC
+   NL%BLDG_SEPARATION_DIST(IDX) = C%BLDG_SEPARATION_DIST
+   NL%BLDG_FOOTPRINT_FRAC(IDX) = C%BLDG_FOOTPRINT_FRAC
+   NL%RAD_DIST(IDX) = C%RAD_DIST
+   NL%WIND_PROP(IDX) = C%WIND_PROP
+   NL%HEAT_VALUE(IDX) = C%HEAT_VALUE
+   NL%HRR_TRANSIENT(IDX) = C%HRR_TRANSIENT
+   NL%ABSOLUTE_U(IDX) = C%AbsOLUTE_U
+   NL%TOTAL_DFC_RECEIVED(IDX) = C%TOTAL_DFC_RECEIVED
+   NL%TOTAL_RAD_RECEIVED(IDX) = C%TOTAL_RAD_RECEIVED
+#endif
+#ifdef _UMDSPOTTING
+   NL%TAU_EMBERGEN(IDX) = C%TAU_EMBERGEN
+   NL%LOCAL_EMBERGEN_DURATION(IDX) = C%LOCAL_EMBERGEN_DURATION
+   NL%T_START_SPOTTING(IDX) = C%T_START_SPOTTING
+   NL%T_END_SPOTTING(IDX) = C%T_END_SPOTTING
+#endif
+
+! *****************************************************************************
+END SUBROUTINE SYNC_DLL_NODE_TO_SOA_TAGGED
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_DLL_TO_SOA_SURF(L, NL)
+! *****************************************************************************
+! Bridge sync: copies DLL fields to SoA before calling SURFACE_SPREAD_RATE_NL.
+! To be removed once full dual-write is implemented.
+
+TYPE(DLL), INTENT(IN) :: L
+TYPE(NODE_LIST), INTENT(INOUT) :: NL
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+NL%NUM_NODES = L%NUM_NODES
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   NL%IX(I)          = C%IX
+   NL%IY(I)          = C%IY
+   NL%IFBFM(I)       = C%IFBFM
+   NL%M1(I)          = C%M1
+   NL%M10(I)         = C%M10
+   NL%M100(I)        = C%M100
+   NL%MLH(I)         = C%MLH
+   NL%MLW(I)         = C%MLW
+   NL%WSMF(I)        = C%WSMF
+   NL%TANSLP2(I)     = C%TANSLP2
+   NL%ADJ(I)         = C%ADJ
+#ifdef _SUPPRESSION
+   NL%SUPPRESSION_ADJUSTMENT_FACTOR(I) = C%SUPPRESSION_ADJUSTMENT_FACTOR
+#endif
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_DLL_TO_SOA_SURF
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_SURF(NL, L)
+! *****************************************************************************
+! Bridge sync: copies SoA output fields back to DLL after SURFACE_SPREAD_RATE_NL.
+! To be removed once full dual-write is implemented.
+
+TYPE(NODE_LIST), INTENT(IN) :: NL
+TYPE(DLL), INTENT(INOUT) :: L
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   C%IR                = NL%IR(I)
+   C%PHIW_SURFACE      = NL%PHIW_SURFACE(I)
+   C%PHIS_SURFACE      = NL%PHIS_SURFACE(I)
+   C%VS0               = NL%VS0(I)
+   C%VELOCITY_DMS_SURFACE = NL%VELOCITY_DMS_SURFACE(I)
+   C%HPUA_SURFACE      = NL%HPUA_SURFACE(I)
+   C%FLIN_DMS_SURFACE  = NL%FLIN_DMS_SURFACE(I)
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_SURF
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_DLL_TO_SOA_CROWN(L, NL)
+! *****************************************************************************
+! Bridge sync: copies DLL fields to SoA before calling CROWN_SPREAD_RATE_NL.
+! To be removed once full dual-write is implemented.
+
+TYPE(DLL), INTENT(IN) :: L
+TYPE(NODE_LIST), INTENT(INOUT) :: NL
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+NL%NUM_NODES = L%NUM_NODES
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   NL%IX(I)               = C%IX
+   NL%IY(I)               = C%IY
+   NL%M1(I)               = C%M1
+   NL%FMC(I)              = C%FMC
+   NL%WS20_NOW(I)         = C%WS20_NOW
+   NL%FLIN_DMS_SURFACE(I) = C%FLIN_DMS_SURFACE
+   NL%FLIN_SURFACE(I)     = C%FLIN_SURFACE
+   NL%VS0(I)              = C%VS0
+   NL%CRITICAL_FLIN(I)     = C%CRITICAL_FLIN
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_DLL_TO_SOA_CROWN
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_CROWN(NL, L)
+! *****************************************************************************
+! Bridge sync: copies SoA output fields back to DLL after CROWN_SPREAD_RATE_NL.
+! To be removed once full dual-write is implemented.
+
+TYPE(NODE_LIST), INTENT(IN) :: NL
+TYPE(DLL), INTENT(INOUT) :: L
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   C%HPUA_CANOPY   = NL%HPUA_CANOPY(I)
+   C%CRITICAL_FLIN = NL%CRITICAL_FLIN(I)
+   C%CROWN_FIRE    = NL%CROWN_FIRE(I)
+   C%PHIW_CROWN    = NL%PHIW_CROWN(I)
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_CROWN
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_DLL_TO_SOA_SURF_SLOT(C, NL, IDX)
+! *****************************************************************************
+! Bridge sync: copies a single DLL node's fields to a single SoA slot.
+! Used by call site 4 (single-node mode, newly tagged cells).
+
+TYPE(NODE), POINTER, INTENT(IN)    :: C
+TYPE(NODE_LIST),      INTENT(INOUT) :: NL
+INTEGER,              INTENT(IN)    :: IDX
+
+NL%IX(IDX)          = C%IX
+NL%IY(IDX)          = C%IY
+NL%IFBFM(IDX)       = C%IFBFM
+NL%M1(IDX)          = C%M1
+NL%M10(IDX)         = C%M10
+NL%M100(IDX)        = C%M100
+NL%MLH(IDX)         = C%MLH
+NL%MLW(IDX)         = C%MLW
+NL%WSMF(IDX)        = C%WSMF
+NL%TANSLP2(IDX)     = C%TANSLP2
+NL%ADJ(IDX)         = C%ADJ
+#ifdef _SUPPRESSION
+NL%SUPPRESSION_ADJUSTMENT_FACTOR(IDX) = C%SUPPRESSION_ADJUSTMENT_FACTOR
+#endif
+
+! *****************************************************************************
+END SUBROUTINE SYNC_DLL_TO_SOA_SURF_SLOT
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_SURF_SLOT(NL, IDX, C)
+! *****************************************************************************
+! Bridge sync: copies a single SoA slot's output fields back to a DLL node.
+
+TYPE(NODE_LIST), INTENT(IN)    :: NL
+INTEGER,         INTENT(IN)    :: IDX
+TYPE(NODE), POINTER, INTENT(INOUT) :: C
+
+C%IR                = NL%IR(IDX)
+C%PHIW_SURFACE      = NL%PHIW_SURFACE(IDX)
+C%PHIS_SURFACE      = NL%PHIS_SURFACE(IDX)
+C%VS0               = NL%VS0(IDX)
+C%VELOCITY_DMS_SURFACE = NL%VELOCITY_DMS_SURFACE(IDX)
+C%HPUA_SURFACE      = NL%HPUA_SURFACE(IDX)
+C%FLIN_DMS_SURFACE  = NL%FLIN_DMS_SURFACE(IDX)
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_SURF_SLOT
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_DLL_TO_SOA_CROWN_SLOT(C, NL, IDX)
+! *****************************************************************************
+! Bridge sync: copies a single DLL node's crown fields to a single SoA slot.
+
+TYPE(NODE), POINTER, INTENT(IN)    :: C
+TYPE(NODE_LIST),      INTENT(INOUT) :: NL
+INTEGER,              INTENT(IN)    :: IDX
+
+NL%IX(IDX)               = C%IX
+NL%IY(IDX)               = C%IY
+NL%M1(IDX)               = C%M1
+NL%FMC(IDX)              = C%FMC
+NL%WS20_NOW(IDX)         = C%WS20_NOW
+NL%FLIN_DMS_SURFACE(IDX) = C%FLIN_DMS_SURFACE
+NL%FLIN_SURFACE(IDX)     = C%FLIN_SURFACE
+NL%VS0(IDX)              = C%VS0
+NL%CRITICAL_FLIN(IDX)    = C%CRITICAL_FLIN
+
+! *****************************************************************************
+END SUBROUTINE SYNC_DLL_TO_SOA_CROWN_SLOT
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_CROWN_SLOT(NL, IDX, C)
+! *****************************************************************************
+! Bridge sync: copies a single SoA slot's crown output fields back to a DLL node.
+
+TYPE(NODE_LIST), INTENT(IN)    :: NL
+INTEGER,         INTENT(IN)    :: IDX
+TYPE(NODE), POINTER, INTENT(INOUT) :: C
+
+C%HPUA_CANOPY   = NL%HPUA_CANOPY(IDX)
+C%CRITICAL_FLIN = NL%CRITICAL_FLIN(IDX)
+C%CROWN_FIRE    = NL%CROWN_FIRE(IDX)
+C%PHIW_CROWN    = NL%PHIW_CROWN(IDX)
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_CROWN_SLOT
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_NORMAL(NL, L)
+! *****************************************************************************
+! Bridge sync: copies SoA normal vector and PHIP_OLD fields back to DLL.
+! To be removed once full dual-write is implemented.
+
+TYPE(NODE_LIST), INTENT(IN)    :: NL
+TYPE(DLL),       INTENT(INOUT) :: L
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   C%NORMVECTORX = NL%NORMVECTORX(I)
+   C%NORMVECTORY = NL%NORMVECTORY(I)
+   C%PHIP_OLD    = NL%PHIP_OLD(I)
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_NORMAL
+! *****************************************************************************
+
+! *****************************************************************************
+SUBROUTINE SYNC_SOA_TO_DLL_UXUY(NL, L)
+! *****************************************************************************
+! Bridge sync: copies SoA output fields from UX_AND_UY_ELLIPTICAL_NL back to DLL.
+! To be removed once full dual-write is implemented.
+
+TYPE(NODE_LIST), INTENT(IN)    :: NL
+TYPE(DLL),       INTENT(INOUT) :: L
+INTEGER :: I
+TYPE(NODE), POINTER :: C
+
+C => L%HEAD
+
+DO I = 1, L%NUM_NODES
+   C%UX              = NL%UX(I)
+   C%UY              = NL%UY(I)
+   C%VELOCITY        = NL%VELOCITY(I)
+   C%VELOCITY_DMS    = NL%VELOCITY_DMS(I)
+   C%VBACK           = NL%VBACK(I)
+   C%LOW             = NL%LOW(I)
+   C%NORMVECTORX_DMS = NL%NORMVECTORX_DMS(I)
+   C%NORMVECTORY_DMS = NL%NORMVECTORY_DMS(I)
+   C%FLIN_SURFACE    = NL%FLIN_SURFACE(I)
+   C%FLIN_CANOPY     = NL%FLIN_CANOPY(I)
+   C%PHISX           = NL%PHISX(I)
+   C%PHISY           = NL%PHISY(I)
+   C%UXOUSX          = NL%UXOUSX(I)
+   C%UYOUSY          = NL%UYOUSY(I)
+   C%NEED_SLOPE_CALC = NL%NEED_SLOPE_CALC(I)
+   C%ABSOLUTE_U      = NL%ABSOLUTE_U(I)
+   C%SIGN_X          = NL%SIGN_X(I)
+   C%SIGN_Y          = NL%SIGN_Y(I)
+   C%HEAT_VALUE      = NL%HEAT_VALUE(I)
+   C%TOTAL_DFC_RECEIVED = NL%TOTAL_DFC_RECEIVED(I)
+   C%TOTAL_RAD_RECEIVED = NL%TOTAL_RAD_RECEIVED(I)
+#ifdef _UMDSPOTTING
+   C%LOCAL_EMBERGEN_DURATION = NL%LOCAL_EMBERGEN_DURATION(I)
+#endif
+   C => C%NEXT
+ENDDO
+
+! *****************************************************************************
+END SUBROUTINE SYNC_SOA_TO_DLL_UXUY
 ! *****************************************************************************
 
 ! *****************************************************************************

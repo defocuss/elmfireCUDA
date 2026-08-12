@@ -2329,6 +2329,37 @@ END SUBROUTINE WRITE_STATION
 ! *****************************************************************************
 
 ! *****************************************************************************
+SUBROUTINE WRITE_STATION_NL(NL, NODE_INDEX, IRANK, ICASE, T) ! List of nodes version of WRITE_STATION
+! *****************************************************************************
+
+INTEGER, INTENT(IN) :: IRANK, ICASE, NODE_INDEX
+REAL, INTENT(IN) :: T
+TYPE(NODE_LIST), INTENT(IN) :: NL
+LOGICAL :: LOPEN
+INTEGER :: IOS
+CHARACTER(11) :: FN
+CHARACTER(7) :: SEVEN
+
+WRITE(SEVEN, '(I7.7)') ICASE
+
+FN = SEVEN // '.csv'
+INQUIRE(UNIT=LUNODES+IRANK,OPENED=LOPEN)
+
+IF (.NOT. LOPEN) THEN 
+   OPEN(LUNODES+IRANK,FILE=TRIM(FN),FORM='FORMATTED',STATUS='REPLACE',IOSTAT=IOS)
+   WRITE(LUNODES+IRANK,'(A)') 'IRANK,ICASE,T,M1,M10,M100,MLH,MLW,WD20_NOW,WS20_NOW,WSMF'
+ENDIF
+
+WRITE(LUNODES+IRANK,'(I4, ",", I7, ",", F10.1, ",", 8(F8.3, ",") )') IRANK, ICASE, T, &
+   NL%M1(NODE_INDEX), NL%M10(NODE_INDEX), NL%M100(NODE_INDEX), NL%MLH(NODE_INDEX), &
+   NL%MLW(NODE_INDEX), NL%WD20_NOW(NODE_INDEX), NL%WS20_NOW(NODE_INDEX), NL%WSMF(NODE_INDEX)
+
+! *****************************************************************************
+END SUBROUTINE WRITE_STATION_NL
+! *****************************************************************************
+
+
+! *****************************************************************************
 SUBROUTINE PARSE_ENVI_HEADER(HDR_FILE_NAME, DESCRIPTION, SAMPLES, LINES, BANDS, HEADER_OFFSET, FILE_TYPE, DATA_TYPE, INTERLEAVE, BYTE_ORDER, BAND_NAMES, COORDINATE_SYSTEM, DATA_IGNORE_VALUE, DEFAULT_BANDS, PROJECTION_NAME, X_PIXEL_REFERENCE, Y_PIXEL_REFERENCE, EASTING, NORTHING, X_PIXEL_SIZE, Y_PIXEL_SIZE)
 ! *****************************************************************************
 IMPLICIT NONE
