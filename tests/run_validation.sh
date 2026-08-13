@@ -23,6 +23,9 @@ export ELMFIRE_BASE_DIR="$REPO_ROOT"
 export ELMFIRE_INSTALL_DIR="$REPO_ROOT/build/linux/bin"
 ELMFIRE_VER="${ELMFIRE_VER:-2025.1002}"
 
+# Build mode: gnu (default) or cuda
+BUILD_MODE="${BUILD_MODE:-gnu}"
+
 # Base directory for immutable baselines
 BASELINE_DIR="${BASELINE_DIR:-/home/david/Tests}"
 
@@ -33,6 +36,7 @@ OPT_FILES=(
   "build/source/elmfire_level_set.f90"
   "build/source/elmfire_subs.f90"
   "build/source/elmfire_spread_rate.f90"
+  "build/source/elmfire_gpu.cuf"
 )
 
 TUT_NUMS=(01 02 03)
@@ -135,14 +139,22 @@ build_binary() {
     local label=$1
     echo ""
     echo "=========================================="
-    echo "Building ${label} binary"
+    echo "Building ${label} binary (mode: ${BUILD_MODE})"
     echo "=========================================="
 
     cd "${REPO_ROOT}/build/linux"
-    ./make_gnu.sh
 
     local built_bin
-    built_bin="${ELMFIRE_INSTALL_DIR}/elmfire_${ELMFIRE_VER}"
+    if [ "$BUILD_MODE" = "cuda" ]; then
+        ./make_cuda.sh
+        built_bin="${ELMFIRE_INSTALL_DIR}/elmfire_cuda_${ELMFIRE_VER}"
+        # Tutorial scripts look for elmfire_$ELMFIRE_VER, so prepend cuda_
+        export ELMFIRE_VER="cuda_${ELMFIRE_VER}"
+    else
+        ./make_gnu.sh
+        built_bin="${ELMFIRE_INSTALL_DIR}/elmfire_${ELMFIRE_VER}"
+    fi
+
     if [ ! -f "${built_bin}" ]; then
         echo "ERROR: Expected binary ${built_bin} not found after build."
         exit 1
@@ -207,9 +219,10 @@ run_tutorial() {
     local fire_area
     fire_area=$(grep "Fire area" "run_${phase}.log" | tail -1 | sed 's/.*Fire area:/Fire area:/')
 
-    # Save outputs
+    # Save outputs (rasters + isochrones)
     mkdir -p "${SCRIPT_DIR}/${num}-outputs_${phase}"
     cp ./outputs/*.tif "${SCRIPT_DIR}/${num}-outputs_${phase}/"
+    cp ./outputs/*.shp ./outputs/*.shx ./outputs/*.dbf ./outputs/*.prj "${SCRIPT_DIR}/${num}-outputs_${phase}/" 2>/dev/null || true
 
     echo "  ✓ ${fire_area}"
 }
