@@ -11,6 +11,9 @@ USE ELMFIRE_SUPPRESSION
 #endif
 USE ELMFIRE_SPREAD_RATE
 USE ELMFIRE_VARS
+#ifdef _CUDA
+USE ELMFIRE_GPU ! CUDA GPU module
+#endif
 
 IMPLICIT NONE
 
@@ -423,7 +426,11 @@ continue
    IF (CROWN_FIRE_MODEL .GT. 0) CALL CROWN_SPREAD_RATE(LIST_TAGGED, C)
    DO ISTEP=1,2
       ! Calcaulate components of normal vector
+#ifdef _CUDA
+      CALL CALC_NORMAL_VECTORS_CUDA (ISTEP, HALFRCELLSIZE)
+#else
       CALL CALC_NORMAL_VECTORS (ISTEP, HALFRCELLSIZE)
+#endif
 
       ! Calculate x and y components of velocity from elliptical spread dimensions
       CALL UX_AND_UY_ELLIPTICAL(LIST_BURNED, LIST_BURNED, 1.0, ISTEP, T, DYNAMIC_ARRAY)
@@ -703,7 +710,11 @@ DO WHILE (T .LE. TSTOP .OR. IDUMPCOUNT .LE. NDUMPS)
    DO ISTEP = 1, 2
 
 ! Calcaulate components of normal vector
+#ifdef _CUDA
+      CALL CALC_NORMAL_VECTORS_CUDA (ISTEP, HALFRCELLSIZE)
+#else
       CALL CALC_NORMAL_VECTORS (ISTEP, HALFRCELLSIZE)
+#endif
       CALL ACCUMULATE_CPU_USAGE(41, IT1, IT2)
 
 ! Calculate x and y components of velocity from elliptical spread dimensions

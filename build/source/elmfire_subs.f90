@@ -206,7 +206,7 @@ IF (PATH(1:1) .EQ. '/') THEN
    DELETECOMMAND    = '/bin/rm -f '
 ELSE
    OPERATING_SYSTEM = 'windows'
-   PATH_SEPARATOR   = '\'
+   PATH_SEPARATOR   = ACHAR(92) !ASCII code for backslash \ - Change due to nvfortran issue
    DELETECOMMAND    = 'del   '
 ENDIF
 

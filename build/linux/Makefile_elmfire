@@ -17,7 +17,7 @@ setup:
 setup_win:
 %.obj : %.mod
 
-.SUFFIXES: .f90 .for .o .obj
+.SUFFIXES: .f90 .for .o .obj .cuf
 
 .f90.o:
 	$(FCOMPL) -c $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) $<
@@ -26,6 +26,8 @@ setup_win:
 .for.o:
 	$(FCOMPL) -c $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) $<
 .for.obj:
+	$(FCOMPL) -c $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) $<
+.cuf.o:
 	$(FCOMPL) -c $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) $<
 
 #Gnu compiler:
@@ -57,6 +59,13 @@ gnu_mpi_debug_linux : FFLAGS = -O0 -g -Wall -fcheck=all -fbounds-check -fbacktra
 gnu_mpi_debug_linux : FCOMPL = $(ELMFIRE_FCOMPL_MPI_GNU)
 gnu_mpi_debug_linux : obj = elmfire_debug
 gnu_mpi_debug_linux : setup $(obj_mpi)
+	$(FCOMPL) $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) -o $(obj) $(obj_mpi)
+
+# CUDA (nvfortran):
+cuda_linux : FFLAGS = -O3 -cuda -Mpreprocess -Mnobackslash -Mextend -cpp -march=native
+cuda_linux : FCOMPL = $(ELMFIRE_FCOMPL_MPI_GNU)
+cuda_linux : obj = elmfire_cuda
+cuda_linux : setup $(obj_mpi)
 	$(FCOMPL) $(ELMFIRE_PRECOMPILER_FLAGS) $(FFLAGS) -o $(obj) $(obj_mpi)
 
 # Intel compiler:
