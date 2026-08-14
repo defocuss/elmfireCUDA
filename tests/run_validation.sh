@@ -46,15 +46,24 @@ TUT_NAMES=("constant-wind" "transient-wind" "real-fuels")
 T01_RUN_SH="${REPO_ROOT}/tutorials/01-constant-wind/01-run.sh"
 T01_BACKUP="${T01_RUN_SH}.bak"
 
+# Path to a tutorial's run script, given its index into TUT_NUMS/TUT_NAMES
+tut_run_sh() {
+    echo "${REPO_ROOT}/tutorials/$(printf '%02d' "${TUT_NUMS[$1]}")-${TUT_NAMES[$1]}/01-run.sh"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Trap: always restore the T01 script on exit
+# Trap: always restore any patched tutorial script on exit
 # ─────────────────────────────────────────────────────────────────────────────
 
 cleanup() {
-    if [ -f "$T01_BACKUP" ]; then
-        mv "$T01_BACKUP" "$T01_RUN_SH"
-        echo "(Restored ${T01_RUN_SH})"
-    fi
+    for i in "${!TUT_NUMS[@]}"; do
+        local run_sh
+        run_sh="$(tut_run_sh "$i")"
+        if [ -f "${run_sh}.bak" ]; then
+            mv "${run_sh}.bak" "$run_sh"
+            echo "(Restored ${run_sh})"
+        fi
+    done
 }
 trap cleanup EXIT
 
@@ -189,7 +198,9 @@ run_tutorial() {
         cp "$T01_RUN_SH" "$T01_BACKUP"
         sed -i 's/DOMAINSIZE=12000.0/DOMAINSIZE=120000.0/' "$T01_RUN_SH"
         sed -i 's/SIMULATION_TSTOP=19800.0/SIMULATION_TSTOP=86400.0/' "$T01_RUN_SH"
-        echo "  (Patched T01 to DOMAINSIZE=120000, SIMULATION_TSTOP=86400)"
+        # Preserve fire_size_stats.csv (the T01 script otherwise deletes all .csv)
+        sed -i 's|\./outputs/\*\.csv ||' "$T01_RUN_SH"
+        echo "  (Patched T01 to DOMAINSIZE=120000, SIMULATION_TSTOP=86400, preserve stats CSV)"
     fi
 
     # Build the command
@@ -200,8 +211,13 @@ run_tutorial() {
         cmd="./01-run.sh"
     fi
 
-    # Run and log
+    # Run and log (with wall-clock timing)
+    local start_time end_time wall_time
+    start_time=$(date +%s.%N)
     eval "$cmd" > "run_${phase}.log" 2>&1
+    end_time=$(date +%s.%N)
+    wall_time=$(awk "BEGIN {print $end_time - $start_time}")
+    echo "  (Wall clock time: ${wall_time}s)"
 
     # Restore T01 script immediately after run
     if [ "$num" = "01" ] && [ -f "$T01_BACKUP" ]; then
@@ -219,10 +235,11 @@ run_tutorial() {
     local fire_area
     fire_area=$(grep "Fire area" "run_${phase}.log" | tail -1 | sed 's/.*Fire area:/Fire area:/')
 
-    # Save outputs (rasters + isochrones)
+    # Save outputs (rasters + isochrones + stats)
     mkdir -p "${SCRIPT_DIR}/${num}-outputs_${phase}"
     cp ./outputs/*.tif "${SCRIPT_DIR}/${num}-outputs_${phase}/"
     cp ./outputs/*.shp ./outputs/*.shx ./outputs/*.dbf ./outputs/*.prj "${SCRIPT_DIR}/${num}-outputs_${phase}/" 2>/dev/null || true
+    cp ./outputs/fire_size_stats.csv "${SCRIPT_DIR}/${num}-outputs_${phase}/" 2>/dev/null || true
 
     echo "  ✓ ${fire_area}"
 }
@@ -245,6 +262,70 @@ build_binary "optimized"
 for i in "${!TUT_NUMS[@]}"; do
     run_tutorial "${TUT_NUMS[$i]}" "${TUT_NAMES[$i]}"
 done
+
+# ── NSYS (optional, CUDA only) ──
+# When RUN_NSYS=yes, re-run all tutorials under nsys and export GPU kernel /
+# memcpy / API stats to tests/XX-outputs_after/gpu_stats.txt. Each tutorial's
+# 01-run.sh is sed-patched at runtime to inject $ELMFIRE_WRAP before the
+# elmfire invocation and immediately restored — no permanent edits to
+# tutorial scripts. The default pipeline skips this to avoid profiling
+# overhead on every run.
+if [ "$BUILD_MODE" = "cuda" ] && [ "${RUN_NSYS:-no}" = "yes" ] && command -v nsys >/dev/null 2>&1; then
+    echo ""
+    echo "=========================================="
+    echo "PHASE: NSYS PROFILING (all tutorials, CUDA only)"
+    echo "=========================================="
+
+    for i in "${!TUT_NUMS[@]}"; do
+        num="${TUT_NUMS[$i]}"
+        name="${TUT_NAMES[$i]}"
+        tut_dir="${REPO_ROOT}/tutorials/${num}-${name}"
+        run_sh="${tut_dir}/01-run.sh"
+        bak="${run_sh}.bak"
+
+        echo ""
+        echo "--- Tutorial ${num}: ${name} (nsys) ---"
+        cd "$tut_dir"
+        rm -rf ./outputs ./scratch ./inputs
+
+        # Backup the tutorial script
+        cp "$run_sh" "$bak"
+
+        # T01 override: patch to 120 km / 24 h to match baseline
+        if [ "$num" = "01" ]; then
+            sed -i 's/DOMAINSIZE=12000.0/DOMAINSIZE=120000.0/' "$run_sh"
+            sed -i 's/SIMULATION_TSTOP=19800.0/SIMULATION_TSTOP=86400.0/' "$run_sh"
+            sed -i 's|\./outputs/\*\.csv ||' "$run_sh"
+        fi
+
+        # Inject ELMFIRE_WRAP before the elmfire invocation
+        sed -i 's/^elmfire_\$ELMFIRE_VER/$ELMFIRE_WRAP elmfire_$ELMFIRE_VER/' "$run_sh"
+
+        # Run the tutorial with nsys wrapping only the elmfire binary.
+        # --trace=cuda excludes OS-runtime tracing: on the 120km T01 domain the
+        # full trace overflows nsys's protobuf serialization (ProtobufSerializeException).
+        export ELMFIRE_WRAP="nsys profile --trace=cuda -o ./outputs/profile"
+        if [ "$num" = "03" ]; then
+            ELMFIRE_BASE_DIR=${ELMFIRE_BASE_DIR} ./01-run.sh > run_nsys.log 2>&1
+        else
+            ./01-run.sh > run_nsys.log 2>&1
+        fi
+        unset ELMFIRE_WRAP
+
+        # Restore the tutorial script
+        mv "$bak" "$run_sh"
+
+        # Export nsys stats to the after-outputs dir
+        rep=$(ls ./outputs/profile.nsys-rep* 2>/dev/null | head -1)
+        if [ -n "$rep" ]; then
+            nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum "$rep" \
+                > "${SCRIPT_DIR}/${num}-outputs_after/gpu_stats.txt" 2>&1
+            echo "  GPU stats exported to tests/${num}-outputs_after/gpu_stats.txt"
+        else
+            echo "  WARNING: no nsys profile found for T${num} (did the run finish?)"
+        fi
+    done
+fi
 
 # ── COMPARE ──
 echo ""

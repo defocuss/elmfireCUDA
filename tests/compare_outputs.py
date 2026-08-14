@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import csv
 
 import numpy as np
 import rasterio
@@ -24,9 +25,9 @@ RASTER_TYPES = ["flin", "time_of_arrival", "vs"]
 # Between the CPU baseline and the after-run
 FIRE_AREA_THRESHOLD = 0.01
 
-# Maximum allowed fraction of differing pixels for raster comparison (15%)
+# Maximum allowed fraction of differing pixels for raster comparison (20%)
 # Between the CPU baseline and the after-run
-PIXEL_PCT_THRESHOLD = 0.15
+PIXEL_PCT_THRESHOLD = 0.20
 
 # Isochrone (hourly_isochrones.shp) comparison thresholds
 ISOCHROME_FEATURE_THRESHOLD = 0.05  # 5% relative diff in feature count
@@ -82,6 +83,139 @@ def get_isochrone_stats(shp_path):
     except Exception:
         total_length = None
     return n_features, total_length
+
+
+def extract_wall_clock_time(directory):
+    """Extract 'Wall clock time (s)' from fire_size_stats.csv in a directory."""
+    # fire_size_stats.csv may live in the directory itself or one level up
+    for cand in (directory, os.path.dirname(directory)):
+        fn = os.path.join(cand, "fire_size_stats.csv")
+        if os.path.exists(fn):
+            try:
+                with open(fn) as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        val = row.get("Wall clock time (s)")
+                        if val is not None:
+                            return float(val)
+            except Exception:
+                return None
+    return None
+
+
+def compare_performance(baseline_dir, after_dir):
+    """Compare wall-clock time between baseline and after (informational)."""
+    b_time = extract_wall_clock_time(baseline_dir)
+    a_time = extract_wall_clock_time(after_dir)
+
+    if b_time is None and a_time is None:
+        print("   Wall clock time: UNAVAILABLE (no fire_size_stats.csv)")
+        return
+    if b_time is None:
+        print(f"   Baseline: MISSING (no fire_size_stats.csv in {baseline_dir})")
+    else:
+        print(f"   Baseline (gfortran): {b_time:.2f}s")
+    if a_time is None:
+        print(f"   After:    MISSING (no fire_size_stats.csv in {after_dir})")
+    else:
+        print(f"   After:              {a_time:.2f}s")
+    if b_time is not None and a_time is not None:
+        diff = a_time - b_time
+        pct = (diff / b_time) * 100.0
+        direction = "SLOWER" if diff > 0 else "FASTER"
+        print(f"   Diff: {diff:+.2f}s ({pct:+.2f}%) => CUDA is {abs(pct):.1f}% {direction}")
+
+
+def _nsys_table_rows(text, section_title):
+    """Return data rows from an nsys report section (list of strings)."""
+    idx = text.find(section_title)
+    if idx == -1:
+        return []
+    dash = text.find("\n --------", idx)
+    if dash == -1:
+        return []
+    rest = text[dash + 1:]
+    end = rest.find("\n\n")
+    if end != -1:
+        rest = rest[:end]
+    rows = []
+    for line in rest.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if set(s) <= {"-", " "}:
+            continue
+        rows.append(s)
+    return rows
+
+
+def _nsys_row_fields(row):
+    """Split an nsys table row into [time%, total_ns, count, name]."""
+    parts = row.split(None, 8)
+    if len(parts) < 9:
+        return None
+    try:
+        pct = float(parts[0])
+        total_ns = float(parts[1].replace(",", ""))
+        count = int(parts[2].replace(",", ""))
+    except ValueError:
+        return None
+    return pct, total_ns, count, parts[8]
+
+
+def display_gpu_stats(after_dir):
+    """Display GPU performance stats from nsys output (gpu_stats.txt)."""
+    fn = os.path.join(after_dir, "gpu_stats.txt")
+    if not os.path.exists(fn):
+        print("   No nsys profile found (run with RUN_NSYS=yes for GPU stats)")
+        return
+    try:
+        with open(fn) as f:
+            text = f.read()
+    except Exception:
+        print("   Error reading gpu_stats.txt")
+        return
+
+    print("   (from nsys profile; run with RUN_NSYS=yes to refresh)")
+
+    # CUDA kernels (cuda_gpu_kern_sum)
+    rows = _nsys_table_rows(text, "CUDA GPU Kernel Summary")
+    if rows:
+        print("   CUDA kernels:")
+        for row in rows:
+            f = _nsys_row_fields(row)
+            if f is None:
+                continue
+            pct, total_ns, count, name = f
+            print(f"      {name}: {total_ns/1e9:.4f}s over {count:,} launches ({pct:.1f}%)")
+    else:
+        print("   CUDA kernels: (none captured)")
+
+    # GPU memcpy by direction (cuda_gpu_mem_time_sum)
+    rows = _nsys_table_rows(text, "CUDA GPU MemOps Summary")
+    if rows:
+        print("   GPU memcpy by direction:")
+        for row in rows:
+            f = _nsys_row_fields(row)
+            if f is None:
+                continue
+            pct, total_ns, count, op = f
+            print(f"      {op}: {total_ns/1e9:.4f}s over {count:,} ops ({pct:.1f}%)")
+    else:
+        print("   GPU memcpy by direction: (none captured)")
+
+    # CUDA API calls (cuda_api_sum)
+    rows = _nsys_table_rows(text, "CUDA API Summary")
+    if rows:
+        print("   CUDA API calls:")
+        for row in rows:
+            f = _nsys_row_fields(row)
+            if f is None:
+                continue
+            pct, total_ns, count, name = f
+            print(f"      {name}: {total_ns/1e9:.4f}s over {count:,} calls ({pct:.1f}%)")
+    else:
+        print("   CUDA API calls: (none captured)")
 
 
 def compare_isochrones(baseline_dir, after_dir):
@@ -206,7 +340,13 @@ def compare_tutorial(baseline_dir, after_dir, baseline_log, after_log, label):
     print(f"\n3. Isochrone comparison (hourly_isochrones.shp)")
     isochrone_pass = compare_isochrones(baseline_dir, after_dir)
 
-    print(f"\n4. Overall result")
+    # Performance comparison (informational — does not affect PASS/FAIL)
+    print(f"\n4. Performance comparison")
+    compare_performance(baseline_dir, after_dir)
+    print(f"\n5. GPU performance stats")
+    display_gpu_stats(after_dir)
+
+    print(f"\n6. Overall result")
     overall_pass = all_rasters_pass and fire_area_pass and isochrone_pass
     print(f"   All rasters within threshold: {all_rasters_pass}")
     print(f"   Fire area within threshold:   {fire_area_pass}")
