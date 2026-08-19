@@ -7,13 +7,12 @@ MODULE ELMFIRE_GPU ! Module for GPU acceleration of ELMFIRE
    IMPLICIT NONE
 
    ! SoA host arrays realocated every timestep
-   INTEGER, ALLOCATABLE :: IX_h(:), IY_h(:)
    REAL,    ALLOCATABLE :: NORMVECTORX_h(:), NORMVECTORY_h(:), PHIP_OLD_h(:)
+   REAL,    ALLOCATABLE :: PHIP_NBHD_h(:,:) ! Values of PHIP
 
    ! Device arrays
-   INTEGER, DEVICE, ALLOCATABLE :: IX_d(:), IY_d(:)
    REAL,    DEVICE, ALLOCATABLE :: NORMVECTORX_d(:), NORMVECTORY_d(:), PHIP_OLD_d(:)
-   REAL,    DEVICE, ALLOCATABLE :: PHIP_d(:,:)
+   REAL,    DEVICE, ALLOCATABLE :: PHIP_NBHD_d(:,:)
 
    ! State
    INTEGER, SAVE :: N_d = 0 ! Current size of the device arrays
@@ -32,41 +31,39 @@ SUBROUTINE CALC_NORMAL_VECTORS_CUDA(ISTEP, HALFRCELLSIZE) ! CUDA version of the 
 
    N = LIST_TAGGED%NUM_NODES ! Get the number of nodes in the tagged list
 
-   IF (.NOT. ALLOCATED(IX_h) .OR. SIZE(IX_h) < N) THEN
-       IF (ALLOCATED(IX_h)) DEALLOCATE(IX_h, IY_h, NORMVECTORX_h, NORMVECTORY_h, PHIP_OLD_h)
-       ALLOCATE(IX_h(N), IY_h(N), NORMVECTORX_h(N), NORMVECTORY_h(N), PHIP_OLD_h(N))
+   IF (N == 0) RETURN ! No nodes, nothing to do
+
+   IF (.NOT. ALLOCATED(NORMVECTORX_h) .OR. SIZE(NORMVECTORX_h) < N) THEN ! If the host arrays are not allocated or too small, reallocate them
+       IF (ALLOCATED(NORMVECTORX_h)) DEALLOCATE(NORMVECTORX_h, NORMVECTORY_h, PHIP_OLD_h, PHIP_NBHD_h)
+       ALLOCATE(NORMVECTORX_h(N), NORMVECTORY_h(N), PHIP_OLD_h(N), PHIP_NBHD_h(5,N))
    ENDIF
 
-   ! DLL to SoA
+   ! DLL to SoA of PHIP values
    C => LIST_TAGGED%HEAD
    DO I = 1, N
-      IX_h(I) = C%IX
-      IY_h(I) = C%IY
+      PHIP_NBHD_h(1,I) = PHIP(C%IX-1, C%IY)   ! W
+      PHIP_NBHD_h(2,I) = PHIP(C%IX+1, C%IY)   ! E
+      PHIP_NBHD_h(3,I) = PHIP(C%IX,   C%IY-1) ! S
+      PHIP_NBHD_h(4,I) = PHIP(C%IX,   C%IY+1) ! N
+      PHIP_NBHD_h(5,I) = PHIP(C%IX,   C%IY)   ! C
       C => C%NEXT
    ENDDO
 
    ! Allocate device arrays if not allocated or if N has changed
    IF (N_d < N) THEN
-      IF (ALLOCATED(IX_d)) DEALLOCATE(IX_d, IY_d, NORMVECTORX_d, NORMVECTORY_d, PHIP_OLD_d)
-      ALLOCATE(IX_d(N), IY_d(N), NORMVECTORX_d(N), NORMVECTORY_d(N), PHIP_OLD_d(N))
+      IF (ALLOCATED(NORMVECTORX_d)) DEALLOCATE(NORMVECTORX_d, NORMVECTORY_d, PHIP_OLD_d, PHIP_NBHD_d)
+      ALLOCATE(NORMVECTORX_d(N), NORMVECTORY_d(N), PHIP_OLD_d(N), PHIP_NBHD_d(5,N))
       N_d = N
    ENDIF
 
-   ! Allocate PHIP_d if not allocated (Device variable)
-   IF (.NOT. ALLOCATED(PHIP_d)) THEN
-      ALLOCATE(PHIP_d(SIZE(PHIP, 1), SIZE(PHIP, 2)))
-   ENDIF
-
    ! Copy to device arrays
-   IX_d(1:N) = IX_h(1:N)
-   IY_d(1:N) = IY_h(1:N)
-   PHIP_d = PHIP
+   PHIP_NBHD_d(1:5,1:N) = PHIP_NBHD_h(1:5,1:N)
 
    ! Launch calc normal vectors kernel
    DIM_BLOCK = dim3(256, 1, 1)
-   DIM_GRID = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1)
-   CALL CALC_NORMAL_VECTORS_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( IX_d, IY_d, PHIP_d, NORMVECTORX_d,&
-    NORMVECTORY_d, PHIP_OLD_d, N, ISTEP, HALFRCELLSIZE, SIZE(PHIP, 1), SIZE(PHIP, 2) )
+   DIM_GRID = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1) ! Grid stride loop revisar
+   CALL CALC_NORMAL_VECTORS_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( PHIP_NBHD_d, NORMVECTORX_d,&
+    NORMVECTORY_d, PHIP_OLD_d, N, ISTEP, HALFRCELLSIZE )
 
    ! Check for any CUDA errors, and synchronize the device to ensure all threads have completed
    CUDA_ERR = cudaDeviceSynchronize()
@@ -90,16 +87,15 @@ END SUBROUTINE CALC_NORMAL_VECTORS_CUDA
 ! *****************************************************************************
 
 ! *****************************************************************************
-ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( IX, IY, PHIP, NORMVECTORX, NORMVECTORY, PHIP_OLD, N, ISTEP, HALFRCELLSIZE, NX, NY) ! Kernel to calculate the normal vectors of the nodes in the tagged list
+ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( PHIP_NBHD, NORMVECTORX, NORMVECTORY, PHIP_OLD, N, ISTEP, HALFRCELLSIZE) ! Kernel to calculate the normal vectors of the nodes in the tagged list
 ! *****************************************************************************
 
-   INTEGER, VALUE :: N, ISTEP, NX, NY
+   INTEGER, VALUE :: N, ISTEP
    REAL, VALUE :: HALFRCELLSIZE
-   INTEGER, DEVICE :: IX(N), IY(N)
-   REAL, DEVICE :: PHIP(NX,NY)
+   REAL, DEVICE :: PHIP_NBHD(5,N)
    REAL, DEVICE :: NORMVECTORX(N), NORMVECTORY(N), PHIP_OLD(N)
 
-   INTEGER :: I, IX_l, IY_l
+   INTEGER :: I
    REAL :: DPHIDX, DPHIDY, RMAGGRADPHI
    REAL, PARAMETER :: EPSILON = 1E-30, BIG = 3E4
 
@@ -107,19 +103,16 @@ ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( IX, IY, PHIP, NORMVEC
 
    IF (I > N) RETURN ! Avoid out-of-bounds threads from doing any work
 
-   IX_l = IX(I)
-   IY_l = IY(I)
-
    IF (ISTEP .EQ. 1) THEN
-      PHIP_OLD(I) = PHIP(IX_l,IY_l)
-      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP(IX_l,IY_l+1) - PHIP(IX_l,IY_l-1)), BIG ), -BIG)
-      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP(IX_l+1,IY_l) - PHIP(IX_l-1,IY_l)), BIG ), -BIG)
+      PHIP_OLD(I) = PHIP_NBHD(5,I)
+      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(4,I) - PHIP_NBHD(3,I)), BIG ), -BIG)
+      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(2,I) - PHIP_NBHD(1,I)), BIG ), -BIG)
    ELSE
-      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP(IX_l+1,IY_l) - PHIP(IX_l-1,IY_l)), BIG ), -BIG)
-      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP(IX_l,IY_l+1) - PHIP(IX_l,IY_l-1)), BIG ), -BIG)
+      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(2,I) - PHIP_NBHD(1,I)), BIG ), -BIG)
+      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(4,I) - PHIP_NBHD(3,I)), BIG ), -BIG)
    ENDIF
 
-   RMAGGRADPHI = 1. / MAX(SQRT( DPHIDX * DPHIDX + DPHIDY * DPHIDY ), EPSILON)
+   RMAGGRADPHI = 1. / MAX(SQRT( DPHIDX * DPHIDX + DPHIDY * DPHIDY ), EPSILON)·
 
    NORMVECTORX(I) = RMAGGRADPHI * DPHIDX
    NORMVECTORY(I) = RMAGGRADPHI * DPHIDY
