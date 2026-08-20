@@ -6,22 +6,38 @@ MODULE ELMFIRE_GPU ! Module for GPU acceleration of ELMFIRE
    USE ELMFIRE_VARS
    IMPLICIT NONE
 
-   ! SoA host arrays realocated every timestep
+   ! SoA host arrays realocated every timestep (CALC_NORMAL_VECTORS_CUDA)
    REAL,    ALLOCATABLE :: NORMVECTORX_h(:), NORMVECTORY_h(:), PHIP_OLD_h(:)
    REAL,    ALLOCATABLE :: PHIP_NBHD_h(:,:) ! Values of PHIP
 
-   ! Device arrays
+   ! Device arrays (CALC_NORMAL_VECTORS_CUDA)
    REAL,    DEVICE, ALLOCATABLE :: NORMVECTORX_d(:), NORMVECTORY_d(:), PHIP_OLD_d(:)
    REAL,    DEVICE, ALLOCATABLE :: PHIP_NBHD_d(:,:)
 
-   ! State
-   INTEGER, SAVE :: N_d = 0 ! Current size of the device arrays
+   ! State (CALC_NORMAL_VECTORS_CUDA)
+   INTEGER, SAVE :: CALC_NORMAL_N_d = 0 ! Current size of the device arrays for normal vector calculation
    INTEGER :: CUDA_ERR ! Error code for CUDA operations
+
+   ! *****************************************************************************
+
+   ! SoA host arrays reallocated every timestep (RK2_INTEGRATE_CUDA)
+   REAL,    ALLOCATABLE :: RK2_PHIP_OLD_h(:), RK2_UX_h(:), RK2_UY_h(:)
+   REAL,    ALLOCATABLE :: RK2_DPHIDX_LIMITED_h(:), RK2_DPHIDY_LIMITED_h(:)
+   REAL,    ALLOCATABLE :: RK2_PHIP_NOW_h(:), RK2_PHIP_NEW_h(:)
+
+   ! Device arrays (RK2_INTEGRATE_CUDA)
+   REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_OLD_d(:), RK2_UX_d(:), RK2_UY_d(:)
+   REAL,    DEVICE, ALLOCATABLE :: RK2_DPHIDX_LIMITED_d(:), RK2_DPHIDY_LIMITED_d(:)
+   REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_NOW_d(:), RK2_PHIP_NEW_d(:)
+
+   ! State (RK2_INTEGRATE_CUDA)
+   INTEGER, SAVE :: RK2_N_d = 0 ! Current size of the device arrays for RK2 integration
     
 CONTAINS
 
 ! *****************************************************************************
-SUBROUTINE CALC_NORMAL_VECTORS_CUDA(ISTEP, HALFRCELLSIZE) ! CUDA version of the normal vector calculation, this is the wraper
+! CUDA version of the normal vector calculation, this is the wraper
+SUBROUTINE CALC_NORMAL_VECTORS_CUDA(ISTEP, HALFRCELLSIZE)
 ! *****************************************************************************
    INTEGER, INTENT(IN) :: ISTEP
    REAL, INTENT(IN) :: HALFRCELLSIZE
@@ -50,10 +66,10 @@ SUBROUTINE CALC_NORMAL_VECTORS_CUDA(ISTEP, HALFRCELLSIZE) ! CUDA version of the 
    ENDDO
 
    ! Allocate device arrays if not allocated or if N has changed
-   IF (N_d < N) THEN
+   IF (CALC_NORMAL_N_d < N) THEN
       IF (ALLOCATED(NORMVECTORX_d)) DEALLOCATE(NORMVECTORX_d, NORMVECTORY_d, PHIP_OLD_d, PHIP_NBHD_d)
       ALLOCATE(NORMVECTORX_d(N), NORMVECTORY_d(N), PHIP_OLD_d(N), PHIP_NBHD_d(5,N))
-      N_d = N
+      CALC_NORMAL_N_d = N
    ENDIF
 
    ! Copy to device arrays
@@ -87,7 +103,8 @@ END SUBROUTINE CALC_NORMAL_VECTORS_CUDA
 ! *****************************************************************************
 
 ! *****************************************************************************
-ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( PHIP_NBHD, NORMVECTORX, NORMVECTORY, PHIP_OLD, N, ISTEP, HALFRCELLSIZE) ! Kernel to calculate the normal vectors of the nodes in the tagged list
+! Kernel to calculate the normal vectors of the nodes in the tagged list
+ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( PHIP_NBHD, NORMVECTORX, NORMVECTORY, PHIP_OLD, N, ISTEP, HALFRCELLSIZE)
 ! *****************************************************************************
 
    INTEGER, VALUE :: N, ISTEP
@@ -119,6 +136,110 @@ ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( PHIP_NBHD, NORMVECTOR
 
 ! *****************************************************************************
 END SUBROUTINE CALC_NORMAL_VECTORS_KERNEL
+! *****************************************************************************
+
+! *****************************************************************************
+! CUDA version of the 2nd order Runge-Kutta integration of PHIP, this is the wrapper
+SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
+! *****************************************************************************
+
+   REAL, INTENT(IN) :: DT
+   INTEGER, INTENT(IN) :: ISTEP
+   INTEGER :: I, N
+   TYPE(NODE), POINTER :: C
+   TYPE(dim3) :: DIM_GRID, DIM_BLOCK
+
+   N = LIST_TAGGED%NUM_NODES ! Get the number of nodes in the tagged list
+
+   IF (N == 0) RETURN ! No nodes, nothing to do
+
+   IF (.NOT. ALLOCATED(RK2_PHIP_OLD_h) .OR. SIZE(RK2_PHIP_OLD_h) < N) THEN ! If the host arrays are not allocated or too small, reallocate them
+      IF (ALLOCATED(RK2_PHIP_OLD_h)) DEALLOCATE(RK2_PHIP_OLD_h, RK2_UX_h, RK2_UY_h, &
+         RK2_DPHIDX_LIMITED_h, RK2_DPHIDY_LIMITED_h, RK2_PHIP_NOW_h, RK2_PHIP_NEW_h)
+      ALLOCATE(RK2_PHIP_OLD_h(N), RK2_UX_h(N), RK2_UY_h(N), &
+         RK2_DPHIDX_LIMITED_h(N), RK2_DPHIDY_LIMITED_h(N), RK2_PHIP_NOW_h(N), RK2_PHIP_NEW_h(N))
+   ENDIF
+
+   ! DLL to SoA
+   C => LIST_TAGGED%HEAD
+   DO I = 1, N
+      RK2_PHIP_OLD_h(I)       = C%PHIP_OLD
+      RK2_UX_h(I)             = C%UX
+      RK2_UY_h(I)             = C%UY
+      RK2_DPHIDX_LIMITED_h(I) = C%DPHIDX_LIMITED
+      RK2_DPHIDY_LIMITED_h(I) = C%DPHIDY_LIMITED
+      IF (ISTEP == 2) RK2_PHIP_NOW_h(I) = PHIP(C%IX, C%IY) ! ISTEP=2 needs the current on-grid value; kernel cannot read PHIP directly
+      C => C%NEXT
+   ENDDO
+
+   ! Allocate device arrays if not allocated or if N has changed
+   IF (RK2_N_d < N) THEN
+      IF (ALLOCATED(RK2_PHIP_OLD_d)) DEALLOCATE(RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
+         RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d)
+      ALLOCATE(RK2_PHIP_OLD_d(N), RK2_UX_d(N), RK2_UY_d(N), &
+         RK2_DPHIDX_LIMITED_d(N), RK2_DPHIDY_LIMITED_d(N), RK2_PHIP_NOW_d(N), RK2_PHIP_NEW_d(N))
+      RK2_N_d = N
+   ENDIF
+
+   ! Copy to device arrays
+   RK2_PHIP_OLD_d(1:N)       = RK2_PHIP_OLD_h(1:N)
+   RK2_UX_d(1:N)             = RK2_UX_h(1:N)
+   RK2_UY_d(1:N)             = RK2_UY_h(1:N)
+   RK2_DPHIDX_LIMITED_d(1:N) = RK2_DPHIDX_LIMITED_h(1:N)
+   RK2_DPHIDY_LIMITED_d(1:N) = RK2_DPHIDY_LIMITED_h(1:N)
+   IF (ISTEP == 2) RK2_PHIP_NOW_d(1:N) = RK2_PHIP_NOW_h(1:N)
+
+   ! Launch RK2 integration kernel
+   DIM_BLOCK = dim3(256, 1, 1)
+   DIM_GRID  = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1)
+   CALL RK2_INTEGRATE_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
+    RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, N, ISTEP, DT )
+
+   ! Check for any CUDA errors, and synchronize the device to ensure all threads have completed
+   CUDA_ERR = cudaDeviceSynchronize()
+
+   ! Copy results from device to host
+   RK2_PHIP_NEW_h(1:N) = RK2_PHIP_NEW_d(1:N)
+
+   ! Scatter the new PHIP values back onto the host grid at each node's position
+   C => LIST_TAGGED%HEAD
+   DO I = 1, N
+      PHIP(C%IX, C%IY) = RK2_PHIP_NEW_h(I)
+      C => C%NEXT
+   ENDDO
+
+! *****************************************************************************
+END SUBROUTINE RK2_INTEGRATE_CUDA
+! *****************************************************************************
+
+! *****************************************************************************
+! Kernel to perform the 2nd order Runge-Kutta integration of PHIP for the nodes in the tagged list
+ATTRIBUTES (GLOBAL) SUBROUTINE RK2_INTEGRATE_KERNEL( PHIP_OLD, UX, UY, DPHIDX_LIMITED, DPHIDY_LIMITED, &
+                                                       PHIP_NOW, PHIP_NEW, N, ISTEP, DT )
+! *****************************************************************************
+
+   INTEGER, VALUE :: N, ISTEP
+   REAL,    VALUE :: DT
+   REAL, DEVICE :: PHIP_OLD(N), UX(N), UY(N), DPHIDX_LIMITED(N), DPHIDY_LIMITED(N)
+   REAL, DEVICE :: PHIP_NOW(N), PHIP_NEW(N)
+
+   INTEGER :: I
+
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x ! Index of the current thread in GPU
+
+   IF (I > N) RETURN ! Avoid out-of-bounds threads from doing any work
+
+   IF (ISTEP .EQ. 1) THEN
+      PHIP_NEW(I) = PHIP_OLD(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))
+      IF ( PHIP_NEW(I) .NE. PHIP_NEW(I) ) PHIP_NEW(I) = 1.0
+      IF ( PHIP_NEW(I) .LT. -100.0 )      PHIP_NEW(I) = -100.0
+      IF ( PHIP_NEW(I) .GT.  100.0 )      PHIP_NEW(I) =  100.0
+   ELSE
+      PHIP_NEW(I) = 0.5 * (PHIP_OLD(I) + (PHIP_NOW(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))))
+   ENDIF
+
+! *****************************************************************************
+END SUBROUTINE RK2_INTEGRATE_KERNEL
 ! *****************************************************************************
 
 END MODULE ELMFIRE_GPU
