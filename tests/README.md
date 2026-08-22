@@ -24,6 +24,12 @@ cd tests
 ./run_validation.sh
 ```
 
+To rebuild the baselines from the current code instead of comparing (see [Regenerating baselines](#regenerating-baselines)):
+
+```bash
+./run_validation.sh --save-baselines
+```
+
 ### CUDA build
 
 To validate the CUDA-accelerated binary instead of the standard gfortran build:
@@ -55,65 +61,6 @@ BUILD_MODE=cuda RUN_NSYS=yes ./run_validation.sh
 | `ELMFIRE_INSTALL_DIR` | `$(pwd)/../build/linux/bin` | Where to find / build the binary |
 | `BUILD_MODE` | `gnu` | Build target: `gnu` (gfortran) or `cuda` (nvfortran GPU) |
 | `RUN_NSYS` | `no` | `yes` to re-run all tutorials under `nsys` (CUDA mode) and export kernel stats |
-
-### Expected output
-
-```
-======================================================================
-ELMFIRE OUTPUT VALIDATION: Tutorial 01
-======================================================================
-
-1. Fire area (stdout)
-   Baseline:  72886.2 acres
-   After:     73007.2 acres
-   Diff:      0.17% (threshold: 1.00%)
-   Status:    PASS
-
-2. Raster pixel comparison
-   flin: PASS (2.05% pixels differ, max_diff=1.12e+04, threshold=20.0%)
-   time_of_arrival: PASS (2.01% pixels differ, max_diff=9.64e+04, threshold=20.0%)
-   vs: PASS (2.05% pixels differ, max_diff=1.01e+04, threshold=20.0%)
-
-3. Isochrone comparison (hourly_isochrones.shp)
-   Feature count:  baseline=187, after=189, diff=1.07% (threshold: 5.0%)  PASS
-   Total length:   baseline=139136.1m, after=139002.5m, diff=0.10% (threshold: 1.00%)  PASS
-   Status: PASS
-
-4. Performance comparison
-   Baseline (gfortran): 13.03s
-   After:               32.96s
-   Diff: +19.93s (+152.91%) => CUDA is 152.9% SLOWER
-
-5. GPU performance stats (RUN_NSYS=yes)
-   (from nsys profile; run with RUN_NSYS=yes to refresh)
-   CUDA kernels:
-      elmfire_gpu_calc_normal_vectors_kernel_: 0.0059s over 2,674 launches (100.0%)
-   GPU memcpy by direction:
-      [CUDA memcpy Host-to-Device]: 0.1544s over 13,870 ops (95.2%)
-      [CUDA memcpy Device-to-Host]: 0.0078s over 6,685 ops (4.8%)
-   CUDA API calls:
-      cudaMemcpy: 0.3239s over 14,709 calls (56.7%)
-      cudaDeviceSynchronize: 0.1719s over 2,676 calls (30.1%)
-      cudaLaunchKernel: 0.0284s over 2,676 calls (5.0%)
-
-   (Without RUN_NSYS=yes, section 5 prints: "No nsys profile found (run with RUN_NSYS=yes for GPU stats)")
-
-6. Overall result
-   All rasters within threshold: True
-   Fire area within threshold:   True
-   Isochrones within threshold:  True
-
-   => VALIDATION PASSED: All metrics within thresholds.
-======================================================================
-```
-
-### Runtime
-
-- T01 (120 km, 24 h): ~5–10 minutes
-- T02 (12 km): ~1 minute
-- T03 (real fuels): ~1–2 minutes
-- Total pipeline: ~10–15 minutes
-- With `RUN_NSYS=yes`, each tutorial is re-run under `nsys`, roughly doubling the total wall-clock time (~20–25 minutes).
 
 ## How it works
 
@@ -150,13 +97,16 @@ If a test **FAILS**, it means the current code produced different results from t
 
 ## Regenerating baselines
 
-If you intentionally changed physics or parameters, you will need new baselines:
+If you intentionally changed physics, parameters, or code, you will need new baselines. Rebuild all three from the current code in one shot:
 
 ```bash
-cd tutorials/01-constant-wind
-bash 01-run.sh
-cp outputs/*.tif /home/david/Tests/T01-constant-wind/outputs/
-cp run_after.log /home/david/Tests/T01-constant-wind/run_baseline.log
+cd tests
+./run_validation.sh --save-baselines
 ```
 
-Do the same for T02 and T03. Then re-run `run_validation.sh` — it should report **PASS** against the new baselines.
+This runs the same pipeline (build + run tutorials, with T01 patched to the 120 km / 24 h domain) but, instead of comparing, overwrites each tutorial's baseline under `$BASELINE_DIR`:
+
+- `outputs/` — rasters (`flin_*.tif`, `time_of_arrival_*.tif`, `vs_*.tif`), isochrone shapefile (`hourly_isochrones.*`), and `fire_size_stats.csv`
+- `run_baseline.log` — stdout log (used to extract "Fire area")
+
+The comparison phase is skipped. Old baselines are overwritten, so make sure that is what you want. Then run `./run_validation.sh` — it should report **PASS** against the new baselines.

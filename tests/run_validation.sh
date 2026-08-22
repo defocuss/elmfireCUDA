@@ -5,7 +5,8 @@
 # stored in $BASELINE_DIR (default: /home/david/Tests).
 #
 # Usage:
-#   ./run_validation.sh
+#   ./run_validation.sh                 Run validation against baselines
+#   ./run_validation.sh --save-baselines  Rebuild baselines from current code
 #
 # T01 is run with a patched 120 km / 24 h domain so it matches the baseline
 # (the tutorial script itself is left untouched).
@@ -50,6 +51,21 @@ T01_BACKUP="${T01_RUN_SH}.bak"
 tut_run_sh() {
     echo "${REPO_ROOT}/tutorials/$(printf '%02d' "${TUT_NUMS[$1]}")-${TUT_NAMES[$1]}/01-run.sh"
 }
+
+# Rebuild-baselines mode: save current outputs over the immutable baselines
+SAVE_BASELINES=false
+for arg in "$@"; do
+    case "$arg" in
+        --save-baselines)
+            SAVE_BASELINES=true
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $arg"
+            echo "Usage: ./run_validation.sh [--save-baselines]"
+            exit 1
+            ;;
+    esac
+done
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trap: always restore any patched tutorial script on exit
@@ -109,26 +125,32 @@ preflight() {
         rm -rf "${SCRIPT_DIR}/${num}-outputs_after"
     done
 
-    # 1e. Verify baselines exist
-    local missing_baseline=false
-    for t in T01-constant-wind T02-transient-wind T03-real-fuels; do
-        if [ ! -d "${BASELINE_DIR}/${t}/outputs" ]; then
-            missing_baseline=true
-            echo "  Missing baseline dir: ${BASELINE_DIR}/${t}/outputs"
+    # 1e. Verify baselines exist (skipped in --save-baselines mode, which
+    #     regenerates them)
+    if [ "$SAVE_BASELINES" = true ]; then
+        echo "WARNING: --save-baselines will OVERWRITE existing baselines in ${BASELINE_DIR}"
+        echo "         (T01-constant-wind, T02-transient-wind, T03-real-fuels)"
+    else
+        local missing_baseline=false
+        for t in T01-constant-wind T02-transient-wind T03-real-fuels; do
+            if [ ! -d "${BASELINE_DIR}/${t}/outputs" ]; then
+                missing_baseline=true
+                echo "  Missing baseline dir: ${BASELINE_DIR}/${t}/outputs"
+            fi
+            if [ ! -f "${BASELINE_DIR}/${t}/run_baseline.log" ]; then
+                missing_baseline=true
+                echo "  Missing baseline log: ${BASELINE_DIR}/${t}/run_baseline.log"
+            fi
+        done
+        if [ "$missing_baseline" = true ]; then
+            echo ""
+            echo "ERROR: Baseline results are missing in ${BASELINE_DIR}."
+            echo "Generate them first, e.g.:"
+            echo "  cd tutorials/01-constant-wind && bash 01-run.sh"
+            echo "  cp outputs/*.tif /home/david/Tests/T01-constant-wind/outputs/"
+            echo "  cp run_after.log /home/david/Tests/T01-constant-wind/run_baseline.log"
+            exit 1
         fi
-        if [ ! -f "${BASELINE_DIR}/${t}/run_baseline.log" ]; then
-            missing_baseline=true
-            echo "  Missing baseline log: ${BASELINE_DIR}/${t}/run_baseline.log"
-        fi
-    done
-    if [ "$missing_baseline" = true ]; then
-        echo ""
-        echo "ERROR: Baseline results are missing in ${BASELINE_DIR}."
-        echo "Generate them first, e.g.:"
-        echo "  cd tutorials/01-constant-wind && bash 01-run.sh"
-        echo "  cp outputs/*.tif /home/david/Tests/T01-constant-wind/outputs/"
-        echo "  cp run_after.log /home/david/Tests/T01-constant-wind/run_baseline.log"
-        exit 1
     fi
 
     # 1f. Print config
@@ -242,6 +264,45 @@ run_tutorial() {
     cp ./outputs/fire_size_stats.csv "${SCRIPT_DIR}/${num}-outputs_${phase}/" 2>/dev/null || true
 
     echo "  ✓ ${fire_area}"
+
+    if [ "$SAVE_BASELINES" = true ]; then
+        save_baseline "$num" "$name"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. Baseline saver (used with --save-baselines)
+# ─────────────────────────────────────────────────────────────────────────────
+
+save_baseline() {
+    local num=$1
+    local name=$2
+    local tut_dir="${REPO_ROOT}/tutorials/${num}-${name}"
+    local dst="${BASELINE_DIR}/T${num}-${name}"
+    local dst_outputs="${dst}/outputs"
+
+    echo ""
+    echo "------------------------------------------"
+    echo "Saving baseline T${num}: ${name}"
+    echo "------------------------------------------"
+
+    mkdir -p "$dst"
+    rm -rf "$dst_outputs"
+    mkdir -p "$dst_outputs"
+
+    cp "${tut_dir}"/outputs/*.tif "$dst_outputs/"
+    cp "${tut_dir}"/outputs/*.shp "${tut_dir}"/outputs/*.shx \
+       "${tut_dir}"/outputs/*.dbf "${tut_dir}"/outputs/*.prj \
+       "$dst_outputs/" 2>/dev/null || true
+    cp "${tut_dir}"/outputs/*.bil "${tut_dir}"/outputs/*.hdr \
+       "${tut_dir}"/outputs/*.aux.xml "$dst_outputs/" 2>/dev/null || true
+    cp "${tut_dir}/outputs/fire_size_stats.csv" "$dst_outputs/" 2>/dev/null || true
+    cp "${tut_dir}/run_after.log" "${dst}/run_baseline.log"
+
+    local fire_area
+    fire_area=$(grep "Fire area" "${dst}/run_baseline.log" | tail -1 | sed 's/.*Fire area:/Fire area:/')
+    echo "  ✓ Saved ${dst_outputs} and ${dst}/run_baseline.log"
+    echo "  ✓ ${fire_area}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,13 +389,21 @@ if [ "$BUILD_MODE" = "cuda" ] && [ "${RUN_NSYS:-no}" = "yes" ] && command -v nsy
 fi
 
 # ── COMPARE ──
-echo ""
-echo "=========================================="
-echo "PHASE: COMPARISON"
-echo "=========================================="
+if [ "$SAVE_BASELINES" = true ]; then
+    echo ""
+    echo "=========================================="
+    echo "Baselines saved to ${BASELINE_DIR}"
+    echo "(comparison skipped in --save-baselines mode)"
+    echo "=========================================="
+else
+    echo ""
+    echo "=========================================="
+    echo "PHASE: COMPARISON"
+    echo "=========================================="
 
-cd "$SCRIPT_DIR"
-python3 "$SCRIPT_DIR/compare_outputs.py"
+    cd "$SCRIPT_DIR"
+    python3 "$SCRIPT_DIR/compare_outputs.py"
+fi
 
 echo ""
 echo "=========================================="
