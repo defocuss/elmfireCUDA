@@ -1803,42 +1803,72 @@ REAL(8),    ALLOCATABLE :: R8T(:)
 SELECT CASE (TRIM(PIXELTYPE))
 
    CASE ('BYTE')                                  ! 8-bit unsigned
-      ALLOCATE(B1(1:NPIX)); INQUIRE(IOLENGTH=LRECL) B1(:)
+      ALLOCATE(B1(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 1_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) B1(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) B1(:)
       RVALUES(:) = REAL(IAND(INT(B1, 4), 255))
       DEALLOCATE(B1)
 
    CASE ('UINT16')                                ! 16-bit unsigned
-      ALLOCATE(U2(1:NPIX)); INQUIRE(IOLENGTH=LRECL) U2(:)
+      ALLOCATE(U2(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 2_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) U2(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) U2(:)
       RVALUES(:) = REAL(IAND(INT(U2, 4), 65535))
       DEALLOCATE(U2)
 
    CASE ('INT32')                                 ! 32-bit signed
-      ALLOCATE(I4(1:NPIX)); INQUIRE(IOLENGTH=LRECL) I4(:)
+      ALLOCATE(I4(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 4_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) I4(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) I4(:)
       RVALUES(:) = REAL(I4)
       DEALLOCATE(I4)
 
    CASE ('UINT32')                                ! 32-bit unsigned
-      ALLOCATE(I4(1:NPIX)); INQUIRE(IOLENGTH=LRECL) I4(:)
+      ALLOCATE(I4(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 4_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) I4(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) I4(:)
       RVALUES(:) = REAL(IAND(INT(I4, 8), 4294967295_8))
       DEALLOCATE(I4)
 
    CASE ('FLOAT')                                 ! 32-bit float
-      ALLOCATE(R4T(1:NPIX)); INQUIRE(IOLENGTH=LRECL) R4T(:)
+      ALLOCATE(R4T(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 4_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) R4T(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) R4T(:)
       RVALUES(:) = R4T(:)
       DEALLOCATE(R4T)
 
    CASE ('DOUBLE')                                ! 64-bit float
-      ALLOCATE(R8T(1:NPIX)); INQUIRE(IOLENGTH=LRECL) R8T(:)
+      ALLOCATE(R8T(1:NPIX))
+#ifdef __NVCOMPILER
+      LRECL = INT(NPIX,8) * 8_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
+      INQUIRE(IOLENGTH=LRECL) R8T(:)
+#endif
       CALL OPEN_BSQ_DIRECT(FNBSQ, LRECL, LUN)
       READ(LUN, REC=IREC, IOSTAT=IOS) R8T(:)
       RVALUES(:) = REAL(R8T, 4)
@@ -2109,7 +2139,11 @@ SELECT CASE(TRIM(RASTER%PIXELTYPE))
 
       RASTER%R4(:,:,:) = RASTER%NODATA_VALUE
 
+#ifdef __NVCOMPILER
+      LRECL = INT(SIZE(RVALUES),8) * 4_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
       INQUIRE (IOLENGTH=LRECL) RVALUES(:)
+#endif
       OPEN(LUINPUT, FILE=TRIM(FNBSQ), ACCESS='DIRECT', STATUS='OLD', RECL=LRECL, IOSTAT=IOS)
       IF (IOS .NE. 0) THEN
          WRITE(*,*) 'Problem opening raster file ', TRIM(FNBSQ)
@@ -2132,7 +2166,11 @@ SELECT CASE(TRIM(RASTER%PIXELTYPE))
 
       RASTER%I2(:,:,:) = RASTER%NODATA_VALUE
 
+#ifdef __NVCOMPILER
+      LRECL = INT(SIZE(I2VALUES),8) * 2_8 ! nvfortran: IOLENGTH into INTEGER*8 is unreliable
+#else
       INQUIRE (IOLENGTH=LRECL) I2VALUES(:)
+#endif
       OPEN(LUINPUT, FILE=TRIM(FNBSQ), ACCESS='DIRECT', STATUS='OLD', RECL=LRECL, IOSTAT=IOS)
       IF (IOS .NE. 0) THEN
          WRITE(*,*) 'Problem opening raster file ', TRIM(FNBSQ)
