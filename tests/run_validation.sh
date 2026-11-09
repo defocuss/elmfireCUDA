@@ -22,7 +22,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 export ELMFIRE_BASE_DIR="$REPO_ROOT"
 export ELMFIRE_INSTALL_DIR="$REPO_ROOT/build/linux/bin"
-ELMFIRE_VER="${ELMFIRE_VER:-2025.1002}"
+# Version from the repo-root VERSION file (same source as make_gnu.sh and the
+# tutorials). Exported so the build scripts and tutorials all use the same value.
+export ELMFIRE_VER="${ELMFIRE_VER:-$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")}"
 
 # Build mode: gnu (default) or cuda
 BUILD_MODE="${BUILD_MODE:-gnu}"

@@ -46,7 +46,7 @@ BUILD_MODE=cuda RUN_NSYS=yes ./run_validation.sh
 
 ### What it does
 
-1. **Build** the optimized binary (`elmfire_2025.1002`) from the current working tree.
+1. **Build** the optimized binary (`elmfire_$ELMFIRE_VER`, or `elmfire_cuda_$ELMFIRE_VER` in CUDA mode) from the current working tree.
 2. **Run T01** with a temporarily patched 120 km / 24 h domain (the tutorial script itself is left untouched).
 3. **Run T02** and **T03** with their original parameters.
 4. **Compare** the generated outputs against the baselines in `/home/david/Tests/` using `compare_outputs.py`.
@@ -57,7 +57,7 @@ BUILD_MODE=cuda RUN_NSYS=yes ./run_validation.sh
 | Variable | Default | Description |
 |---|---|---|
 | `BASELINE_DIR` | `/home/david/Tests` | Path to immutable baselines |
-| `ELMFIRE_VER` | `2025.1002` | Version string used in binary name |
+| `ELMFIRE_VER` | contents of repo-root `VERSION` | Version string used in binary name |
 | `ELMFIRE_INSTALL_DIR` | `$(pwd)/../build/linux/bin` | Where to find / build the binary |
 | `BUILD_MODE` | `gnu` | Build target: `gnu` (gfortran) or `cuda` (nvfortran GPU) |
 | `RUN_NSYS` | `no` | `yes` to re-run all tutorials under `nsys` (CUDA mode) and export kernel stats |

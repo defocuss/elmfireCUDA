@@ -1,11 +1,15 @@
 #!/bin/bash
 
-# ELMFIRE version:
-ELMFIRE_VER=2025.1002
+# Always operate from the directory this script lives in (same as make_gnu.sh).
+cd "$(dirname "$(readlink -f "$0")")"
+
+# ELMFIRE version: repo-root VERSION file, same as make_gnu.sh. Override by
+# exporting ELMFIRE_VER. Binary is installed as elmfire_cuda_$ELMFIRE_VER.
+ELMFIRE_VER=${ELMFIRE_VER:-$(tr -d '[:space:]' < ../../VERSION)}
 
 # Use NVIDIA HPC SDK compilers
-export ELMFIRE_FCOMPL_SERIAL_GNU=/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/compilers/bin/nvfortran
-export ELMFIRE_FCOMPL_MPI_GNU=/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/comm_libs/mpi/bin/mpif90
+export ELMFIRE_FCOMPL_SERIAL_GNU=/opt/nvidia/hpc_sdk/Linux_x86_64/26.9/compilers/bin/nvfortran
+export ELMFIRE_FCOMPL_MPI_GNU=/opt/nvidia/hpc_sdk/Linux_x86_64/26.9/comm_libs/mpi/bin/mpif90
 export ELMFIRE_INSTALL_DIR=${ELMFIRE_INSTALL_DIR:-$(pwd)/bin}
 
 # Preprocessor flags: same as gfortran build + _CUDA
