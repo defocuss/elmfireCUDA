@@ -12,7 +12,7 @@ export ELMFIRE_INSTALL_DIR=${ELMFIRE_INSTALL_DIR:-$(pwd)/bin}
 export ELMFIRE_PRECOMPILER_FLAGS="-D_SMOKE -D_WUI -D_UMDSPOTTING -D_SUPPRESSION -D_CUDA"
 
 # Object files: same as standard build + elmfire_gpu.o
-export ELMFIRE_OBJECTS="elmfire_vars.o sort.o elmfire_init.o elmfire_namelists.o elmfire_subs.o elmfire_spread_rate.o elmfire_ignition.o elmfire_io.o elmfire_spotting.o elmfire_suppression.o elmfire_spotting_superseded.o elmfire_calibration.o elmfire_gpu.o elmfire_level_set.o elmfire.o"
+export ELMFIRE_OBJECTS="elmfire_vars.o sort.o elmfire_subs.o elmfire_init.o elmfire_namelists.o elmfire_spread_rate.o elmfire_ignition.o elmfire_io.o elmfire_spotting.o elmfire_suppression.o elmfire_spotting_superseded.o elmfire_calibration.o elmfire_gpu.o elmfire_level_set.o elmfire.o"
 
 # Build
 echo "Making elmfire_cuda_linux"
