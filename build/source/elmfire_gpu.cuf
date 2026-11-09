@@ -24,11 +24,13 @@ MODULE ELMFIRE_GPU ! Module for GPU acceleration of ELMFIRE
    REAL,    ALLOCATABLE :: RK2_PHIP_OLD_h(:), RK2_UX_h(:), RK2_UY_h(:)
    REAL,    ALLOCATABLE :: RK2_DPHIDX_LIMITED_h(:), RK2_DPHIDY_LIMITED_h(:)
    REAL,    ALLOCATABLE :: RK2_PHIP_NOW_h(:), RK2_PHIP_NEW_h(:)
+   LOGICAL, ALLOCATABLE :: RK2_WTU_SPREAD_h(:) ! Interface Model flag per node
 
    ! Device arrays (RK2_INTEGRATE_CUDA)
    REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_OLD_d(:), RK2_UX_d(:), RK2_UY_d(:)
    REAL,    DEVICE, ALLOCATABLE :: RK2_DPHIDX_LIMITED_d(:), RK2_DPHIDY_LIMITED_d(:)
    REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_NOW_d(:), RK2_PHIP_NEW_d(:)
+   LOGICAL, DEVICE, ALLOCATABLE :: RK2_WTU_SPREAD_d(:)
 
    ! State (RK2_INTEGRATE_CUDA)
    INTEGER, SAVE :: RK2_N_d = 0 ! Current size of the device arrays for RK2 integration
@@ -155,9 +157,9 @@ SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
 
    IF (.NOT. ALLOCATED(RK2_PHIP_OLD_h) .OR. SIZE(RK2_PHIP_OLD_h) < N) THEN ! If the host arrays are not allocated or too small, reallocate them
       IF (ALLOCATED(RK2_PHIP_OLD_h)) DEALLOCATE(RK2_PHIP_OLD_h, RK2_UX_h, RK2_UY_h, &
-         RK2_DPHIDX_LIMITED_h, RK2_DPHIDY_LIMITED_h, RK2_PHIP_NOW_h, RK2_PHIP_NEW_h)
+         RK2_DPHIDX_LIMITED_h, RK2_DPHIDY_LIMITED_h, RK2_PHIP_NOW_h, RK2_PHIP_NEW_h, RK2_WTU_SPREAD_h)
       ALLOCATE(RK2_PHIP_OLD_h(N), RK2_UX_h(N), RK2_UY_h(N), &
-         RK2_DPHIDX_LIMITED_h(N), RK2_DPHIDY_LIMITED_h(N), RK2_PHIP_NOW_h(N), RK2_PHIP_NEW_h(N))
+         RK2_DPHIDX_LIMITED_h(N), RK2_DPHIDY_LIMITED_h(N), RK2_PHIP_NOW_h(N), RK2_PHIP_NEW_h(N), RK2_WTU_SPREAD_h(N))
    ENDIF
 
    ! DLL to SoA
@@ -168,6 +170,7 @@ SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
       RK2_UY_h(I)             = C%UY
       RK2_DPHIDX_LIMITED_h(I) = C%DPHIDX_LIMITED
       RK2_DPHIDY_LIMITED_h(I) = C%DPHIDY_LIMITED
+      RK2_WTU_SPREAD_h(I)     = C%WTU_SPREAD
       IF (ISTEP == 2) RK2_PHIP_NOW_h(I) = PHIP(C%IX, C%IY) ! ISTEP=2 needs the current on-grid value; kernel cannot read PHIP directly
       C => C%NEXT
    ENDDO
@@ -175,9 +178,9 @@ SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
    ! Allocate device arrays if not allocated or if N has changed
    IF (RK2_N_d < N) THEN
       IF (ALLOCATED(RK2_PHIP_OLD_d)) DEALLOCATE(RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
-         RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d)
+         RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, RK2_WTU_SPREAD_d)
       ALLOCATE(RK2_PHIP_OLD_d(N), RK2_UX_d(N), RK2_UY_d(N), &
-         RK2_DPHIDX_LIMITED_d(N), RK2_DPHIDY_LIMITED_d(N), RK2_PHIP_NOW_d(N), RK2_PHIP_NEW_d(N))
+         RK2_DPHIDX_LIMITED_d(N), RK2_DPHIDY_LIMITED_d(N), RK2_PHIP_NOW_d(N), RK2_PHIP_NEW_d(N), RK2_WTU_SPREAD_d(N))
       RK2_N_d = N
    ENDIF
 
@@ -187,13 +190,14 @@ SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
    RK2_UY_d(1:N)             = RK2_UY_h(1:N)
    RK2_DPHIDX_LIMITED_d(1:N) = RK2_DPHIDX_LIMITED_h(1:N)
    RK2_DPHIDY_LIMITED_d(1:N) = RK2_DPHIDY_LIMITED_h(1:N)
+   RK2_WTU_SPREAD_d(1:N)     = RK2_WTU_SPREAD_h(1:N)
    IF (ISTEP == 2) RK2_PHIP_NOW_d(1:N) = RK2_PHIP_NOW_h(1:N)
 
    ! Launch RK2 integration kernel
    DIM_BLOCK = dim3(256, 1, 1)
    DIM_GRID  = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1)
    CALL RK2_INTEGRATE_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
-    RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, N, ISTEP, DT )
+    RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, RK2_WTU_SPREAD_d, N, ISTEP, DT )
 
    ! Check for any CUDA errors, and synchronize the device to ensure all threads have completed
    CUDA_ERR = cudaDeviceSynchronize()
@@ -215,14 +219,16 @@ END SUBROUTINE RK2_INTEGRATE_CUDA
 ! *****************************************************************************
 ! Kernel to perform the 2nd order Runge-Kutta integration of PHIP for the nodes in the tagged list
 ATTRIBUTES (GLOBAL) SUBROUTINE RK2_INTEGRATE_KERNEL( PHIP_OLD, UX, UY, DPHIDX_LIMITED, DPHIDY_LIMITED, &
-                                                       PHIP_NOW, PHIP_NEW, N, ISTEP, DT )
+                                                       PHIP_NOW, PHIP_NEW, WTU_SPREAD, N, ISTEP, DT )
 ! *****************************************************************************
 
    INTEGER, VALUE :: N, ISTEP
    REAL,    VALUE :: DT
    REAL, DEVICE :: PHIP_OLD(N), UX(N), UY(N), DPHIDX_LIMITED(N), DPHIDY_LIMITED(N)
    REAL, DEVICE :: PHIP_NOW(N), PHIP_NEW(N)
+   LOGICAL, DEVICE :: WTU_SPREAD(N)
 
+   REAL, PARAMETER :: LIMIT = 1.0 ! Same clamp as CPU RK2_INTEGRATE
    INTEGER :: I
 
    I = (blockIdx%x - 1) * blockDim%x + threadIdx%x ! Index of the current thread in GPU
@@ -231,12 +237,14 @@ ATTRIBUTES (GLOBAL) SUBROUTINE RK2_INTEGRATE_KERNEL( PHIP_OLD, UX, UY, DPHIDX_LI
 
    IF (ISTEP .EQ. 1) THEN
       PHIP_NEW(I) = PHIP_OLD(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))
-      IF ( PHIP_NEW(I) .NE. PHIP_NEW(I) ) PHIP_NEW(I) = 1.0
-      IF ( PHIP_NEW(I) .LT. -100.0 )      PHIP_NEW(I) = -100.0
-      IF ( PHIP_NEW(I) .GT.  100.0 )      PHIP_NEW(I) =  100.0
+      IF ( PHIP_NEW(I) .NE. PHIP_NEW(I) ) PHIP_NEW(I) = 1.0 ! NaN check
+      IF ( PHIP_NEW(I) .LT. -1 * LIMIT )  PHIP_NEW(I) = -1 * LIMIT
+      IF ( PHIP_NEW(I) .GT.  LIMIT )      PHIP_NEW(I) =  LIMIT
    ELSE
       PHIP_NEW(I) = 0.5 * (PHIP_OLD(I) + (PHIP_NOW(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))))
    ENDIF
+
+   IF (WTU_SPREAD(I)) PHIP_NEW(I) = -1.0 ! Interface Model (both RK2 stages)
 
 ! *****************************************************************************
 END SUBROUTINE RK2_INTEGRATE_KERNEL
