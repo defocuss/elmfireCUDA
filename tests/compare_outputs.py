@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ELMFIRE tutorial outputs against immutable baselines in /home/david/Tests/."""
+"""Compare ELMFIRE tutorial outputs against immutable baselines in tests/baselines/."""
 
 import glob
 import os
@@ -15,8 +15,12 @@ import warnings
 # Suppress deprecation warnings
 warnings.filterwarnings("ignore", message="Setting the shape", category=DeprecationWarning)
 
-# Base directory for immutable baselines (env-overrideable)
-BASELINE_DIR = os.environ.get("BASELINE_DIR", "/home/david/Tests")
+# Base directory for immutable baselines (env-overrideable). Default is
+# tests/baselines next to this script, as an absolute path.
+BASELINE_DIR = os.environ.get(
+    "BASELINE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "baselines"),
+)
 
 # The three raster types we expect per tutorial
 RASTER_TYPES = ["flin", "time_of_arrival", "vs"]
@@ -25,9 +29,19 @@ RASTER_TYPES = ["flin", "time_of_arrival", "vs"]
 # Between the CPU baseline and the after-run
 FIRE_AREA_THRESHOLD = 0.01
 
-# Maximum allowed fraction of differing pixels for raster comparison (20%)
-# Between the CPU baseline and the after-run
-PIXEL_PCT_THRESHOLD = 0.20
+# Raster comparison. Pixels are "burned" when they hold a valid value > 0
+# (unburned cells are 0 and nodata is -9999). Both metrics are normalized by
+# the burned area, so they do not depend on how much of the domain burns.
+#
+# 1. Footprint: pixels burned in only one of the two runs, as a fraction of
+#    the pixels burned in either run (1 - Jaccard index of the burned masks).
+FOOTPRINT_MISMATCH_THRESHOLD = 0.01  # 1%
+# 2. Values: among pixels burned in both runs, the fraction whose relative
+#    difference exceeds VALUE_RTOL. nvfortran-vs-gfortran and GPU rounding
+#    produce tiny per-pixel differences (median ~1e-4 relative) that accumulate
+#    through the level-set iterations; a real bug shifts many pixels by far more.
+VALUE_RTOL = 0.10                     # 10% relative difference per pixel
+VALUE_MISMATCH_THRESHOLD = 0.05       # at most 5% of commonly burned pixels
 
 # Isochrone (hourly_isochrones.shp) comparison thresholds
 ISOCHROME_FEATURE_THRESHOLD = 0.05  # 5% relative diff in feature count
@@ -218,6 +232,35 @@ def display_gpu_stats(after_dir):
         print("   CUDA API calls: (none captured)")
 
 
+def compare_raster_arrays(arr_b, arr_a, nodata_b=None, nodata_a=None):
+    """Footprint and value agreement between a baseline and an after raster."""
+    b = arr_b.astype(np.float64)
+    a = arr_a.astype(np.float64)
+    burned_b = np.isfinite(b) & (b > 0)
+    burned_a = np.isfinite(a) & (a > 0)
+    if nodata_b is not None:
+        burned_b &= b != nodata_b
+    if nodata_a is not None:
+        burned_a &= a != nodata_a
+
+    union = burned_b | burned_a
+    both = burned_b & burned_a
+    n_union = int(np.count_nonzero(union))
+    n_only_one = int(np.count_nonzero(burned_b ^ burned_a))
+    footprint_mismatch = n_only_one / n_union if n_union else 0.0
+
+    rel = np.abs(a[both] - b[both]) / np.abs(b[both])
+    value_mismatch = float(np.count_nonzero(rel > VALUE_RTOL)) / rel.size if rel.size else 0.0
+    return {
+        "n_union": n_union,
+        "n_only_one": n_only_one,
+        "footprint_mismatch": footprint_mismatch,
+        "value_mismatch": value_mismatch,
+        "rel_p50": float(np.median(rel)) if rel.size else 0.0,
+        "rel_p99": float(np.percentile(rel, 99)) if rel.size else 0.0,
+    }
+
+
 def compare_isochrones(baseline_dir, after_dir):
     """Compare hourly_isochrones.shp between baseline and after."""
     b_shp = os.path.join(baseline_dir, "hourly_isochrones.shp")
@@ -290,7 +333,7 @@ def compare_tutorial(baseline_dir, after_dir, baseline_log, after_log, label):
         fire_area_pass = False
 
     # Compare .tif raster files by prefix
-    print(f"\n2. Raster pixel comparison")
+    print(f"\n2. Raster comparison (burned footprint + values)")
     all_rasters_pass = True
 
     for rtype in RASTER_TYPES:
@@ -321,20 +364,21 @@ def compare_tutorial(baseline_dir, after_dir, baseline_log, after_log, label):
                 all_rasters_pass = False
                 continue
 
-            identical = np.array_equal(arr_b, arr_a)
-            if identical:
-                print(f"   {rtype}: IDENTICAL (0.00% pixels differ)")
-            else:
-                diff = np.abs(arr_b.astype(np.float64) - arr_a.astype(np.float64))
-                max_diff = np.max(diff)
-                n_diff = np.count_nonzero(diff > 0)
-                total_pixels = arr_b.size
-                frac_diff_pixels = n_diff / total_pixels
-                raster_pass = frac_diff_pixels <= PIXEL_PCT_THRESHOLD
-                if not raster_pass:
-                    all_rasters_pass = False
-                status = "PASS" if raster_pass else "FAIL"
-                print(f"   {rtype}: {status} ({frac_diff_pixels*100:.2f}% pixels differ, max_diff={max_diff:.2e}, threshold={PIXEL_PCT_THRESHOLD*100:.1f}%)")
+            if np.array_equal(arr_b, arr_a):
+                print(f"   {rtype}: IDENTICAL")
+                continue
+
+            res = compare_raster_arrays(arr_b, arr_a, src_b.nodata, src_a.nodata)
+            raster_pass = (res["footprint_mismatch"] <= FOOTPRINT_MISMATCH_THRESHOLD
+                           and res["value_mismatch"] <= VALUE_MISMATCH_THRESHOLD)
+            if not raster_pass:
+                all_rasters_pass = False
+            status = "PASS" if raster_pass else "FAIL"
+            print(f"   {rtype}: {status}")
+            print(f"      footprint: {res['footprint_mismatch']*100:.3f}% of burned pixels burned in only one run "
+                  f"({res['n_only_one']} of {res['n_union']}) (threshold: {FOOTPRINT_MISMATCH_THRESHOLD*100:.1f}%)")
+            print(f"      values:    {res['value_mismatch']*100:.2f}% of common burned pixels differ by >{VALUE_RTOL*100:.0f}% "
+                  f"(threshold: {VALUE_MISMATCH_THRESHOLD*100:.1f}%); relative diff median={res['rel_p50']:.1e}, p99={res['rel_p99']:.1e}")
 
     # Compare isochrone shapefiles if present
     print(f"\n3. Isochrone comparison (hourly_isochrones.shp)")

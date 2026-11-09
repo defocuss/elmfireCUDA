@@ -2,7 +2,7 @@
 # run_validation.sh — ELMFIRE optimization validation pipeline.
 #
 # Compares current (optimized) tutorial outputs against immutable baselines
-# stored in $BASELINE_DIR (default: /home/david/Tests).
+# stored in $BASELINE_DIR (default: <repo>/tests/baselines).
 #
 # Usage:
 #   ./run_validation.sh                 Run validation against baselines
@@ -26,11 +26,24 @@ export ELMFIRE_INSTALL_DIR="$REPO_ROOT/build/linux/bin"
 # tutorials). Exported so the build scripts and tutorials all use the same value.
 export ELMFIRE_VER="${ELMFIRE_VER:-$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")}"
 
+# Python used for compare_outputs.py (needs numpy + rasterio). Defaults to the
+# repo's .venv when present, otherwise python3 on PATH. The tutorials keep using
+# the system python3 (cloudfire/fuel_wx_ign.py needs pytz + grpc there).
+if [ -z "${COMPARE_PYTHON:-}" ]; then
+    if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+        COMPARE_PYTHON="$REPO_ROOT/.venv/bin/python"
+    else
+        COMPARE_PYTHON=python3
+    fi
+fi
+
 # Build mode: gnu (default) or cuda
 BUILD_MODE="${BUILD_MODE:-gnu}"
 
-# Base directory for immutable baselines
-BASELINE_DIR="${BASELINE_DIR:-/home/david/Tests}"
+# Base directory for immutable baselines. Default is derived from this script's
+# location, so it is an absolute path that works on any clone. Exported so
+# compare_outputs.py reads the same directory.
+export BASELINE_DIR="${BASELINE_DIR:-$SCRIPT_DIR/baselines}"
 
 # Prepend install dir to PATH so tutorial scripts find elmfire_$ELMFIRE_VER
 export PATH="${ELMFIRE_INSTALL_DIR}:${PATH}"
@@ -73,6 +86,16 @@ done
 # Trap: always restore any patched tutorial script on exit
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tutorial runs delete and regenerate ./inputs, and upstream tracks some of
+# those files in git (T01 is even regenerated with the patched 120 km domain).
+# Put the tracked ones back so a validation run leaves the tree unmodified.
+restore_tracked_inputs() {
+    local tut_dir=$1
+    if [ -n "$(git -C "$REPO_ROOT" ls-files -- "${tut_dir}/inputs")" ]; then
+        git -C "$REPO_ROOT" checkout -- "${tut_dir}/inputs"
+    fi
+}
+
 cleanup() {
     for i in "${!TUT_NUMS[@]}"; do
         local run_sh
@@ -81,6 +104,7 @@ cleanup() {
             mv "${run_sh}.bak" "$run_sh"
             echo "(Restored ${run_sh})"
         fi
+        restore_tracked_inputs "$(dirname "$run_sh")"
     done
 }
 trap cleanup EXIT
@@ -100,7 +124,14 @@ preflight() {
         exit 1
     fi
 
-    # 1b. Verify pytz (needed for tutorial 03 fuel download)
+    # 1b. Verify the comparison Python has its dependencies
+    if ! "$COMPARE_PYTHON" -c "import numpy, rasterio" 2>/dev/null; then
+        echo "ERROR: $COMPARE_PYTHON cannot import numpy + rasterio (needed by compare_outputs.py)."
+        echo "       Create the venv (uv venv && uv pip install numpy rasterio) or set COMPARE_PYTHON."
+        exit 1
+    fi
+
+    # 1b'. Verify pytz (needed for tutorial 03 fuel download)
     if ! python3 -c "import pytz" 2>/dev/null; then
         echo "ERROR: pytz is not installed. Run: pip install pytz"
         exit 1
@@ -147,10 +178,9 @@ preflight() {
         if [ "$missing_baseline" = true ]; then
             echo ""
             echo "ERROR: Baseline results are missing in ${BASELINE_DIR}."
-            echo "Generate them first, e.g.:"
-            echo "  cd tutorials/01-constant-wind && bash 01-run.sh"
-            echo "  cp outputs/*.tif /home/david/Tests/T01-constant-wind/outputs/"
-            echo "  cp run_after.log /home/david/Tests/T01-constant-wind/run_baseline.log"
+            echo "Generate them first from upstream main (see tests/README.md,"
+            echo "section 'Regenerating baselines'), or from the current tree with:"
+            echo "  ./run_validation.sh --save-baselines"
             exit 1
         fi
     fi
@@ -248,6 +278,7 @@ run_tutorial() {
         mv "$T01_BACKUP" "$T01_RUN_SH"
         echo "  (Restored T01 script)"
     fi
+    restore_tracked_inputs "$tut_dir"
 
     # Check for success
     if ! grep -q "Fire area" "run_${phase}.log"; then
@@ -375,8 +406,9 @@ if [ "$BUILD_MODE" = "cuda" ] && [ "${RUN_NSYS:-no}" = "yes" ] && command -v nsy
         fi
         unset ELMFIRE_WRAP
 
-        # Restore the tutorial script
+        # Restore the tutorial script and its tracked inputs
         mv "$bak" "$run_sh"
+        restore_tracked_inputs "$tut_dir"
 
         # Export nsys stats to the after-outputs dir
         rep=$(ls ./outputs/profile.nsys-rep* 2>/dev/null | head -1)
@@ -404,7 +436,7 @@ else
     echo "=========================================="
 
     cd "$SCRIPT_DIR"
-    python3 "$SCRIPT_DIR/compare_outputs.py"
+    "$COMPARE_PYTHON" "$SCRIPT_DIR/compare_outputs.py"
 fi
 
 echo ""

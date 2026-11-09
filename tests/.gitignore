@@ -1,6 +1,9 @@
 # Generated test outputs (recreated by run_validation.sh)
 *-outputs_after/
 
+# Baselines (regenerated with --save-baselines, see README)
+baselines/
+
 # Python cache
 __pycache__/
 *.pyc

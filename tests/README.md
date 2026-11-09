@@ -1,10 +1,10 @@
 # ELMFIRE Validation Tests
 
-This directory contains the validation pipeline for ELMFIRE. It compares the outputs of the current (optimized) code against immutable baselines stored externally.
+This directory contains the validation pipeline for ELMFIRE. It compares the outputs of the current (optimized) code against immutable baselines stored in `tests/baselines/` (not tracked by git).
 
 ## Baselines
 
-The reference outputs live outside the repo in `/home/david/Tests/`:
+The reference outputs live in `tests/baselines/` (override with `BASELINE_DIR`). They are generated from upstream `main` (see [Regenerating baselines](#regenerating-baselines)):
 
 | Tutorial | Baseline fire area | Domain |
 |---|---|---|
@@ -49,28 +49,33 @@ BUILD_MODE=cuda RUN_NSYS=yes ./run_validation.sh
 1. **Build** the optimized binary (`elmfire_$ELMFIRE_VER`, or `elmfire_cuda_$ELMFIRE_VER` in CUDA mode) from the current working tree.
 2. **Run T01** with a temporarily patched 120 km / 24 h domain (the tutorial script itself is left untouched).
 3. **Run T02** and **T03** with their original parameters.
-4. **Compare** the generated outputs against the baselines in `/home/david/Tests/` using `compare_outputs.py`.
+4. **Compare** the generated outputs against the baselines in `$BASELINE_DIR` using `compare_outputs.py`.
 5. **Optional nsys phase** (`RUN_NSYS=yes`, CUDA mode only): re-runs all three tutorials with `nsys profile --trace=cuda` wrapping just the elmfire binary (sed-patched into each `01-run.sh` at runtime, then restored) and exports `cuda_gpu_kern_sum` / `cuda_api_sum` / `cuda_gpu_mem_time_sum` stats to `XX-outputs_after/gpu_stats.txt`.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `BASELINE_DIR` | `/home/david/Tests` | Path to immutable baselines |
+| `BASELINE_DIR` | `<repo>/tests/baselines` (absolute) | Path to immutable baselines |
 | `ELMFIRE_VER` | contents of repo-root `VERSION` | Version string used in binary name |
 | `ELMFIRE_INSTALL_DIR` | `$(pwd)/../build/linux/bin` | Where to find / build the binary |
 | `BUILD_MODE` | `gnu` | Build target: `gnu` (gfortran) or `cuda` (nvfortran GPU) |
+| `COMPARE_PYTHON` | `<repo>/.venv/bin/python` if present, else `python3` | Python for `compare_outputs.py` (needs `numpy`, `rasterio`) |
 | `RUN_NSYS` | `no` | `yes` to re-run all tutorials under `nsys` (CUDA mode) and export kernel stats |
 
 ## How it works
 
 ### `compare_outputs.py`
 
-- Reads baselines from `BASELINE_DIR` (default `/home/david/Tests/`).
+- Reads baselines from `BASELINE_DIR` (default `tests/baselines/` next to the script).
 - Matches raster files by **prefix** (`flin_*.tif`, `time_of_arrival_*.tif`, `vs_*.tif`) rather than exact filename, so different timestamps in the output names don't break the comparison.
 - Extracts "Fire area: X acres" from stdout logs and compares numerically.
 - **Fire area**: passes if within **1% relative difference** of baseline.
-- **Raster pixels**: passes if **≤20% of pixels differ** (counted as `diff > 0`). Fire rasters are mostly zeros with a thin perimeter; compiler-level FP divergence typically affects only 2–20% of pixels at the fire edge. A 20% threshold catches real bugs while tolerating expected nvfortran-vs-gfortran differences.
+- **Rasters** (`flin`, `time_of_arrival`, `vs`): a pixel is *burned* when it holds a valid value > 0 (unburned = 0, nodata = -9999). Both checks are normalized by the burned area, so they do not depend on how much of the domain the fire covers:
+  - **Footprint**: pixels burned in only one of the two runs, as a fraction of the pixels burned in either run. Passes if **≤1%**.
+  - **Values**: among pixels burned in both runs, the fraction whose relative difference exceeds **10%**. Passes if **≤5%**.
+
+  nvfortran-vs-gfortran and GPU rounding make almost every burned pixel differ slightly (median relative difference ~1e-4), so counting any `diff > 0` would just measure the burned fraction of the domain. The output also prints the median and p99 relative difference.
 - **Isochrones** (contours from `time_of_arrival` via `gdal_contour -i 3600`):
   - **Feature count**: passes if within **5%** difference. Extra fragments ("dots") caused by FP edge noise are expected; a real bug would produce dramatically more or fewer fragments.
   - **Total contour length**: passes if within **1%** relative difference. This is the strongest geometric check — it directly measures whether the fire perimeter shape is conserved regardless of fragment count.
@@ -91,13 +96,23 @@ BUILD_MODE=cuda RUN_NSYS=yes ./run_validation.sh
 If a test **FAILS**, it means the current code produced different results from the baseline. Check:
 
 1. **Fire area mismatch** — the simulation produced a different burned area. Could indicate a logic bug in spread rate, level-set, or ignition handling.
-2. **Raster pixel mismatch** — the `.tif` pixels differ. `compare_outputs.py` prints `max_diff` and `n_diff_pixels` to help quantify the divergence.
+2. **Raster mismatch** — a *footprint* failure means the burned area itself moved (cells burned in one run but not the other); a *values* failure means many commonly burned cells differ by more than 10%. The median/p99 relative difference helps tell systematic errors from edge noise.
 3. **Isochrone mismatch** — either feature count exceeds 5% (contours severely fragmented or missing) or total contour length exceeds 1% (fire perimeter shape changed). Open both shapefiles in QGIS and overlay to inspect.
 4. **Missing files** — if the after run didn't produce outputs, check `tutorials/XX-*/run_after.log` for crash messages.
 
 ## Regenerating baselines
 
-If you intentionally changed physics, parameters, or code, you will need new baselines. Rebuild all three from the current code in one shot:
+Baselines must come from the upstream reference code, not from this branch. After syncing the fork's `main` on GitHub, regenerate them with:
+
+```bash
+cd tests
+./make_baselines_from_main.sh                       # uses origin/main (fetched first)
+BASELINE_REF=<commit> ./make_baselines_from_main.sh  # any other reference
+```
+
+The script checks out the reference in a temporary git worktree (your working tree and `build/linux/bin/` are not touched), copies this branch's test harness into it, runs `run_validation.sh --save-baselines` there with the gfortran build, and writes the results to `$BASELINE_DIR` (default `tests/baselines/`). The reference commit, version and compiler are recorded in `$BASELINE_DIR/BASELINE_SOURCE.txt`.
+
+To instead rebuild all three from the current working tree in one shot (e.g. for experiments):
 
 ```bash
 cd tests
