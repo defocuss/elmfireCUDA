@@ -1,253 +1,1082 @@
 ! *****************************************************************************
 MODULE ELMFIRE_GPU ! Module for GPU acceleration of ELMFIRE
 ! *****************************************************************************
+! GPU-resident level-set core.
+!
+! Phase 1: PHIP lives on the device (PHIP_d) for the whole simulation. Host
+!          writes to PHIP outside the RK2 loop are mirrored either with a full
+!          upload (GPU_LEVEL_SET_NEW_CASE) or cell by cell (GPU_PHIP_MARK_DIRTY).
+! Phase 2: the whole ISTEP=1,2 loop of LEVEL_SET_PROPAGATION (normal vectors,
+!          elliptical velocities, local spread properties, CFL + flux limiter
+!          and RK2) runs on the device. LIST_TAGGED is packed into one SoA
+!          buffer once per timestep (GPU_LEVEL_SET_UPLOAD) and unpacked once
+!          after the loop (GPU_LEVEL_SET_DOWNLOAD).
+!
+! Supported configuration: SURFACE_SPREAD_MODEL = 'ROTHERMEL' and
+! USE_BLDG_SPREAD_MODEL = .FALSE. (see GPU_CORE_SUPPORTED). Anything else falls
+! back to the CPU routines in elmfire_level_set.f90, which remain the reference.
+! The kernels mirror UX_AND_UY_ELLIPTICAL, UPDATE_LOCAL_SPREAD_PROPERTIES,
+! CROWN_CRITICAL_FLIN, CFL_AND_FLUX_LIMITER, CALC_NORMAL_VECTORS and
+! RK2_INTEGRATE: when upstream changes one of those, update the kernel here.
+! *****************************************************************************
 
    USE CUDAFOR ! Cuda fortran
    USE ELMFIRE_VARS
    IMPLICIT NONE
 
-   ! SoA host arrays realocated every timestep (CALC_NORMAL_VECTORS_CUDA)
-   REAL,    ALLOCATABLE :: NORMVECTORX_h(:), NORMVECTORY_h(:), PHIP_OLD_h(:)
-   REAL,    ALLOCATABLE :: PHIP_NBHD_h(:,:) ! Values of PHIP
+   PRIVATE
+   PUBLIC :: GPU_CORE_SUPPORTED, GPU_LEVEL_SET_NEW_CASE, GPU_PHIP_MARK_DIRTY, &
+             GPU_LEVEL_SET_UPLOAD, GPU_LEVEL_SET_DOWNLOAD, &
+             GPU_CALC_NORMAL_VECTORS, GPU_UX_AND_UY_ELLIPTICAL, &
+             GPU_UPDATE_LOCAL_SPREAD_PROPERTIES, GPU_CFL_AND_FLUX_LIMITER, GPU_RK2_INTEGRATE
 
-   ! Device arrays (CALC_NORMAL_VECTORS_CUDA)
-   REAL,    DEVICE, ALLOCATABLE :: NORMVECTORX_d(:), NORMVECTORY_d(:), PHIP_OLD_d(:)
-   REAL,    DEVICE, ALLOCATABLE :: PHIP_NBHD_d(:,:)
+   INTEGER, PARAMETER :: TPB = 256 ! Threads per block (the limiter scan relies on this value)
 
-   ! State (CALC_NORMAL_VECTORS_CUDA)
-   INTEGER, SAVE :: CALC_NORMAL_N_d = 0 ! Current size of the device arrays for normal vector calculation
-   INTEGER :: CUDA_ERR ! Error code for CUDA operations
+   ! ---------------------------------------------------------------------------
+   ! SoA layout of LIST_TAGGED: field-major, i.e. element (I,K) of an (N,NR)
+   ! array is stored at I + (K-1)*N, so each field is contiguous (coalesced).
+   ! ---------------------------------------------------------------------------
+   INTEGER, PARAMETER :: K_PHIP = 1, K_PHIP_OLD = 2, K_NVX = 3, K_NVY = 4, K_UX = 5, K_UY = 6, &
+      K_DPHIDX = 7, K_DPHIDY = 8, K_PHIS_SURFACE = 9, K_PHIW_SURFACE = 10, K_PHIW_CROWN = 11, &
+      K_FLIN_SURFACE = 12, K_FLIN_CANOPY = 13, K_CRITICAL_FLIN = 14, K_HPUA_CANOPY = 15, &
+      K_WD20_NOW = 16, K_WS20_NOW = 17, K_VS0 = 18, K_IR = 19, K_MLH = 20, K_M1 = 21, K_FMC = 22, &
+      K_ISI = 23, K_CFB = 24, K_PHISX = 25, K_PHISY = 26, K_UXOUSX = 27, K_UYOUSY = 28, &
+      K_NVX_DMS = 29, K_NVY_DMS = 30, K_VELOCITY_DMS = 31, K_VBACK = 32, K_LOW = 33, &
+      K_VELOCITY = 34, K_SPREAD_DIRECTION = 35, K_FLAME_LENGTH = 36, K_HRRPUA = 37, &
+      K_LOCAL_EMBERGEN_DURATION = 38
+   INTEGER, PARAMETER :: NR = 38
 
-   ! *****************************************************************************
+   INTEGER, PARAMETER :: KI_IX = 1, KI_IY = 2, KI_IFBFM = 3, KI_CROWN_FIRE = 4, KI_BURNED = 5, &
+      KI_NEED_SLOPE_CALC = 6, KI_WTU_SPREAD = 7, KI_TEST_INTERFACE = 8
+   INTEGER, PARAMETER :: NI = 8
 
-   ! SoA host arrays reallocated every timestep (RK2_INTEGRATE_CUDA)
-   REAL,    ALLOCATABLE :: RK2_PHIP_OLD_h(:), RK2_UX_h(:), RK2_UY_h(:)
-   REAL,    ALLOCATABLE :: RK2_DPHIDX_LIMITED_h(:), RK2_DPHIDY_LIMITED_h(:)
-   REAL,    ALLOCATABLE :: RK2_PHIP_NOW_h(:), RK2_PHIP_NEW_h(:)
-   LOGICAL, ALLOCATABLE :: RK2_WTU_SPREAD_h(:) ! Interface Model flag per node
+   REAL,    ALLOCATABLE, PINNED :: RB_h(:)
+   INTEGER, ALLOCATABLE, PINNED :: IB_h(:)
+   REAL,    DEVICE, ALLOCATABLE :: RB_d(:)
+   INTEGER, DEVICE, ALLOCATABLE :: IB_d(:)
+   INTEGER :: CAP = 0  ! Capacity (nodes) of the SoA buffers
+   INTEGER :: NTAG = 0 ! Number of nodes packed by the last GPU_LEVEL_SET_UPLOAD
 
-   ! Device arrays (RK2_INTEGRATE_CUDA)
-   REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_OLD_d(:), RK2_UX_d(:), RK2_UY_d(:)
-   REAL,    DEVICE, ALLOCATABLE :: RK2_DPHIDX_LIMITED_d(:), RK2_DPHIDY_LIMITED_d(:)
-   REAL,    DEVICE, ALLOCATABLE :: RK2_PHIP_NOW_d(:), RK2_PHIP_NEW_d(:)
-   LOGICAL, DEVICE, ALLOCATABLE :: RK2_WTU_SPREAD_d(:)
+   ! ---------------------------------------------------------------------------
+   ! Phase 1: device copy of the level-set field
+   ! ---------------------------------------------------------------------------
+   REAL, DEVICE, ALLOCATABLE :: PHIP_d(:,:)
+   LOGICAL :: PHIP_FULL_SYNC = .TRUE. ! Upload all of PHIP on the next GPU_LEVEL_SET_UPLOAD
+   LOGICAL :: STATIC_SYNC    = .TRUE. ! Upload rasters/tables on the next GPU_LEVEL_SET_UPLOAD
+   INTEGER, ALLOCATABLE :: DIRTY_IX(:), DIRTY_IY(:) ! Dynamic arrays of host indices of PHIP cells modified outside the GPU loop
+   INTEGER :: NDIRTY = 0 ! Number of dirty cells (cells that have been modified on the host)
+   INTEGER, ALLOCATABLE, PINNED :: DIRTY_IXY_h(:)
+   REAL,    ALLOCATABLE, PINNED :: DIRTY_VAL_h(:)
+   INTEGER, DEVICE, ALLOCATABLE :: DIRTY_IXY_d(:)
+   REAL,    DEVICE, ALLOCATABLE :: DIRTY_VAL_d(:)
 
-   ! State (RK2_INTEGRATE_CUDA)
-   INTEGER, SAVE :: RK2_N_d = 0 ! Current size of the device arrays for RK2 integration
-    
+   ! ---------------------------------------------------------------------------
+   ! Flux limiter scratch. The CPU LIMIT_GRADIENTS declares PHIEAST, PHIWEST,
+   ! PHINORTH and PHISOUTH with initializers, so they are implicitly SAVEd: a
+   ! node whose |DELTALOC| <= EPSILON reuses the value of the last node (in
+   ! LIST_TAGGED order, across calls) that did assign it. The GPU reproduces
+   ! that with a forward fill (max-scan of the last valid index) per variable.
+   ! ---------------------------------------------------------------------------
+   REAL,    DEVICE, ALLOCATABLE :: LIM_VAL_d(:) ! (N,4) candidate values
+   INTEGER, DEVICE, ALLOCATABLE :: LIM_IDX_d(:) ! (N,4) last valid index <= I
+   INTEGER, DEVICE, ALLOCATABLE :: LIM_BLK_d(:) ! (NB,4) per-block carry
+   REAL,    DEVICE :: LIM_CARRY_d(4)            ! SAVEd values after the last node
+   LOGICAL :: LIM_CARRY_INIT = .FALSE.
+   INTEGER :: CAP_BLK = 0 ! How many blocks fit in LIM_BLK_d
+
+   ! ---------------------------------------------------------------------------
+   ! Static rasters and tables (uploaded at the start of each case)
+   ! ---------------------------------------------------------------------------
+   REAL, DEVICE, ALLOCATABLE :: ASP_d(:,:), OMCOSSLPRAD_d(:,:), CBD_d(:,:), CC_d(:,:), CH_d(:,:), CBH_d(:,:)
+   REAL, DEVICE :: SINASPM180_d(-1:360), COSASPM180_d(-1:360), ABSSINASP_d(-1:360), ABSCOSASP_d(-1:360)
+   REAL, DEVICE :: TR_d(0:303,30:120), WSMFEFF_COEFF_d(0:303), B_COEFF_INVERSE_d(0:303)
+
+   ! Scalar parameters in constant memory
+   REAL,    CONSTANT :: G_PHIS_ADJ, G_PHIW_ADJ, G_WSMFEFF_LOW_MULT, G_MAX_LOW, G_PERTURB_CBD, G_PERTURB_CBH, &
+                        G_CROWN_FIRE_ADJ, G_CROWN_FIRE_SPREAD_RATE_LIMIT, G_CRITICAL_CANOPY_COVER, &
+                        G_ASP_CELLSIZE, G_ANALYSIS_CELLSIZE
+   INTEGER, CONSTANT :: G_CROWN_FIRE_MODEL
+   LOGICAL, CONSTANT :: G_NO_SURFACE_FIRE, G_UMD_DURATION
+
+   REAL, PARAMETER :: KWPM2_TO_BTUPFT2MIN = 60. * 0.3048 * 0.3048 / 1.055, FTPMIN_TO_MPS = 0.3048 / 60.
+
 CONTAINS
 
 ! *****************************************************************************
-! CUDA version of the normal vector calculation, this is the wraper
-SUBROUTINE CALC_NORMAL_VECTORS_CUDA(ISTEP, HALFRCELLSIZE)
+! Host API
+! *****************************************************************************
+
+! *****************************************************************************
+LOGICAL FUNCTION GPU_CORE_SUPPORTED()
+! *****************************************************************************
+! True when the GPU core reproduces the CPU path for the current configuration.
+   GPU_CORE_SUPPORTED = (TRIM(SURFACE_SPREAD_MODEL) .EQ. 'ROTHERMEL') .AND. (.NOT. USE_BLDG_SPREAD_MODEL)
+END FUNCTION GPU_CORE_SUPPORTED
+
+! *****************************************************************************
+SUBROUTINE GPU_LEVEL_SET_NEW_CASE()
+! *****************************************************************************
+! Called at the start of every case: PHIP and the static rasters are re-uploaded
+! in full on the next GPU_LEVEL_SET_UPLOAD, and pending dirty cells are dropped.
+   PHIP_FULL_SYNC = .TRUE. ! If true, the next GPU_LEVEL_SET_UPLOAD will copy all of PHIP to PHIP_d
+   STATIC_SYNC    = .TRUE. ! If true, the next GPU_LEVEL_SET_UPLOAD will copy all of the static rasters to device
+   NDIRTY         = 0 ! Reset the number of dirty cells (cells that have been modified on the host)
+END SUBROUTINE GPU_LEVEL_SET_NEW_CASE
+
+! *****************************************************************************
+SUBROUTINE GPU_PHIP_MARK_DIRTY(IX, IY)
+! *****************************************************************************
+! Records a host write to PHIP(IX,IY) made outside the GPU loop, so the next
+! GPU_LEVEL_SET_UPLOAD copies that cell to PHIP_d.
+   INTEGER, INTENT(IN) :: IX, IY
+   INTEGER, ALLOCATABLE :: TMP(:)   
+   INTEGER :: NEWCAP
+
+   IF (PHIP_FULL_SYNC) RETURN ! Everything is going to be uploaded anyway
+
+   IF (.NOT. ALLOCATED(DIRTY_IX)) ALLOCATE(DIRTY_IX(1024), DIRTY_IY(1024)) ! If first time, allocate with some room
+   IF (NDIRTY .GE. SIZE(DIRTY_IX)) THEN ! If list is full, double its size
+      NEWCAP = 2 * SIZE(DIRTY_IX)
+      ALLOCATE(TMP(NEWCAP)); TMP(1:NDIRTY) = DIRTY_IX(1:NDIRTY); CALL MOVE_ALLOC(TMP, DIRTY_IX)
+      ALLOCATE(TMP(NEWCAP)); TMP(1:NDIRTY) = DIRTY_IY(1:NDIRTY); CALL MOVE_ALLOC(TMP, DIRTY_IY)
+   ENDIF
+   NDIRTY = NDIRTY + 1 ! Increment the number of dirty cells
+   DIRTY_IX(NDIRTY) = IX
+   DIRTY_IY(NDIRTY) = IY
+END SUBROUTINE GPU_PHIP_MARK_DIRTY
+
+! *****************************************************************************
+SUBROUTINE GPU_LEVEL_SET_UPLOAD()
+! *****************************************************************************
+! Brings PHIP_d up to date and packs LIST_TAGGED (DLL -> SoA -> device) once
+! per timestep, before the ISTEP loop.
+   INTEGER :: I, N, O
+   TYPE(NODE), POINTER :: C
+
+   IF (STATIC_SYNC) CALL UPLOAD_STATIC()
+   CALL SYNC_PHIP()
+
+   N = LIST_TAGGED%NUM_NODES
+   NTAG = N
+   IF (N .EQ. 0) RETURN
+   CALL ENSURE_CAPACITY(N)
+
+   C => LIST_TAGGED%HEAD
+   DO I = 1, N
+      O = I - N ! RB_h(O + K*N) is element (I,K)
+      RB_h(O + K_PHIP_OLD                *N) = C%PHIP_OLD
+      RB_h(O + K_NVX                     *N) = C%NORMVECTORX
+      RB_h(O + K_NVY                     *N) = C%NORMVECTORY
+      RB_h(O + K_UX                      *N) = C%UX
+      RB_h(O + K_UY                      *N) = C%UY
+      RB_h(O + K_DPHIDX                  *N) = C%DPHIDX_LIMITED
+      RB_h(O + K_DPHIDY                  *N) = C%DPHIDY_LIMITED
+      RB_h(O + K_PHIS_SURFACE            *N) = C%PHIS_SURFACE
+      RB_h(O + K_PHIW_SURFACE            *N) = C%PHIW_SURFACE
+      RB_h(O + K_PHIW_CROWN              *N) = C%PHIW_CROWN
+      RB_h(O + K_FLIN_SURFACE            *N) = C%FLIN_SURFACE
+      RB_h(O + K_FLIN_CANOPY             *N) = C%FLIN_CANOPY
+      RB_h(O + K_CRITICAL_FLIN           *N) = C%CRITICAL_FLIN
+      RB_h(O + K_HPUA_CANOPY             *N) = C%HPUA_CANOPY
+      RB_h(O + K_WD20_NOW                *N) = C%WD20_NOW
+      RB_h(O + K_WS20_NOW                *N) = C%WS20_NOW
+      RB_h(O + K_VS0                     *N) = C%VS0
+      RB_h(O + K_IR                      *N) = C%IR
+      RB_h(O + K_MLH                     *N) = C%MLH
+      RB_h(O + K_M1                      *N) = C%M1
+      RB_h(O + K_FMC                     *N) = C%FMC
+      RB_h(O + K_ISI                     *N) = C%ISI
+      RB_h(O + K_CFB                     *N) = C%CFB
+      RB_h(O + K_PHISX                   *N) = C%PHISX
+      RB_h(O + K_PHISY                   *N) = C%PHISY
+      RB_h(O + K_UXOUSX                  *N) = C%UXOUSX
+      RB_h(O + K_UYOUSY                  *N) = C%UYOUSY
+      RB_h(O + K_NVX_DMS                 *N) = C%NORMVECTORX_DMS
+      RB_h(O + K_NVY_DMS                 *N) = C%NORMVECTORY_DMS
+      RB_h(O + K_VELOCITY_DMS            *N) = C%VELOCITY_DMS
+      RB_h(O + K_VBACK                   *N) = C%VBACK
+      RB_h(O + K_LOW                     *N) = C%LOW
+      RB_h(O + K_VELOCITY                *N) = C%VELOCITY
+      RB_h(O + K_SPREAD_DIRECTION        *N) = C%SPREAD_DIRECTION
+      RB_h(O + K_FLAME_LENGTH            *N) = C%FLAME_LENGTH
+      RB_h(O + K_HRRPUA                  *N) = C%HRRPUA
+#ifdef _UMDSPOTTING
+      RB_h(O + K_LOCAL_EMBERGEN_DURATION *N) = C%LOCAL_EMBERGEN_DURATION
+#endif
+
+      IB_h(O + KI_IX              *N) = C%IX
+      IB_h(O + KI_IY              *N) = C%IY
+      IB_h(O + KI_IFBFM           *N) = C%IFBFM
+      IB_h(O + KI_CROWN_FIRE      *N) = C%CROWN_FIRE
+      IB_h(O + KI_BURNED          *N) = MERGE(1, 0, C%BURNED)
+      IB_h(O + KI_NEED_SLOPE_CALC *N) = MERGE(1, 0, C%NEED_SLOPE_CALC)
+      IB_h(O + KI_WTU_SPREAD      *N) = MERGE(1, 0, C%WTU_SPREAD)
+      IB_h(O + KI_TEST_INTERFACE  *N) = MERGE(1, 0, C%TEST_INTERFACE)
+      C => C%NEXT
+   ENDDO
+
+   RB_d(1:N*NR) = RB_h(1:N*NR)
+   IB_d(1:N*NI) = IB_h(1:N*NI)
+
+END SUBROUTINE GPU_LEVEL_SET_UPLOAD
+
+! *****************************************************************************
+SUBROUTINE GPU_LEVEL_SET_DOWNLOAD()
+! *****************************************************************************
+! Copies the SoA back once per timestep, after the ISTEP loop, and scatters
+! the fields modified on the device (plus PHIP at each node) into LIST_TAGGED.
+   INTEGER :: I, N, O, ISTAT
+   TYPE(NODE), POINTER :: C
+
+   N = NTAG
+   IF (N .EQ. 0) RETURN
+   IF (LIST_TAGGED%NUM_NODES .NE. N) THEN
+      WRITE(*,*) 'ELMFIRE_GPU: LIST_TAGGED changed between upload and download'
+      STOP
+   ENDIF
+
+   CALL GATHER_PHIP_KERNEL<<<BLOCKS(N), TPB>>>(RB_d, IB_d, N)
+   RB_h(1:N*NR) = RB_d(1:N*NR)
+   IB_h(1:N*NI) = IB_d(1:N*NI)
+
+   ISTAT = cudaGetLastError()
+   IF (ISTAT .NE. cudaSuccess) THEN
+      WRITE(*,*) 'ELMFIRE_GPU: CUDA error: ', TRIM(cudaGetErrorString(ISTAT))
+      STOP
+   ENDIF
+
+   C => LIST_TAGGED%HEAD
+   DO I = 1, N
+      O = I - N
+      PHIP(C%IX, C%IY)          = RB_h(O + K_PHIP                    *N)
+      C%PHIP_OLD                = RB_h(O + K_PHIP_OLD                *N)
+      C%NORMVECTORX             = RB_h(O + K_NVX                     *N)
+      C%NORMVECTORY             = RB_h(O + K_NVY                     *N)
+      C%UX                      = RB_h(O + K_UX                      *N)
+      C%UY                      = RB_h(O + K_UY                      *N)
+      C%DPHIDX_LIMITED          = RB_h(O + K_DPHIDX                  *N)
+      C%DPHIDY_LIMITED          = RB_h(O + K_DPHIDY                  *N)
+      C%PHIW_CROWN              = RB_h(O + K_PHIW_CROWN              *N)
+      C%FLIN_SURFACE            = RB_h(O + K_FLIN_SURFACE            *N)
+      C%FLIN_CANOPY             = RB_h(O + K_FLIN_CANOPY             *N)
+      C%CRITICAL_FLIN           = RB_h(O + K_CRITICAL_FLIN           *N)
+      C%HPUA_CANOPY             = RB_h(O + K_HPUA_CANOPY             *N)
+      C%PHISX                   = RB_h(O + K_PHISX                   *N)
+      C%PHISY                   = RB_h(O + K_PHISY                   *N)
+      C%UXOUSX                  = RB_h(O + K_UXOUSX                  *N)
+      C%UYOUSY                  = RB_h(O + K_UYOUSY                  *N)
+      C%NORMVECTORX_DMS         = RB_h(O + K_NVX_DMS                 *N)
+      C%NORMVECTORY_DMS         = RB_h(O + K_NVY_DMS                 *N)
+      C%VELOCITY_DMS            = RB_h(O + K_VELOCITY_DMS            *N)
+      C%VBACK                   = RB_h(O + K_VBACK                   *N)
+      C%LOW                     = RB_h(O + K_LOW                     *N)
+      C%VELOCITY                = RB_h(O + K_VELOCITY                *N)
+      C%SPREAD_DIRECTION        = RB_h(O + K_SPREAD_DIRECTION        *N)
+      C%FLAME_LENGTH            = RB_h(O + K_FLAME_LENGTH            *N)
+      C%HRRPUA                  = RB_h(O + K_HRRPUA                  *N)
+#ifdef _UMDSPOTTING
+      C%LOCAL_EMBERGEN_DURATION = RB_h(O + K_LOCAL_EMBERGEN_DURATION *N)
+#endif
+      C%CROWN_FIRE      = INT(IB_h(O + KI_CROWN_FIRE *N), KIND=KIND(C%CROWN_FIRE))
+      C%NEED_SLOPE_CALC = IB_h(O + KI_NEED_SLOPE_CALC *N) .NE. 0
+      C%WTU_SPREAD      = IB_h(O + KI_WTU_SPREAD      *N) .NE. 0
+      C%TEST_INTERFACE  = IB_h(O + KI_TEST_INTERFACE  *N) .NE. 0
+      C => C%NEXT
+   ENDDO
+
+END SUBROUTINE GPU_LEVEL_SET_DOWNLOAD
+
+! *****************************************************************************
+SUBROUTINE GPU_CALC_NORMAL_VECTORS(ISTEP, HALFRCELLSIZE)
 ! *****************************************************************************
    INTEGER, INTENT(IN) :: ISTEP
    REAL, INTENT(IN) :: HALFRCELLSIZE
-   INTEGER :: I, N
-   TYPE(NODE), POINTER :: C
-   TYPE(dim3) :: DIM_GRID, DIM_BLOCK
+   IF (NTAG .EQ. 0) RETURN
+   CALL CALC_NORMAL_VECTORS_KERNEL<<<BLOCKS(NTAG), TPB>>>(RB_d, IB_d, NTAG, ISTEP, HALFRCELLSIZE)
+END SUBROUTINE GPU_CALC_NORMAL_VECTORS
 
-   N = LIST_TAGGED%NUM_NODES ! Get the number of nodes in the tagged list
+! *****************************************************************************
+SUBROUTINE GPU_UX_AND_UY_ELLIPTICAL(ACCELERATION_FACTOR, ISTEP)
+! *****************************************************************************
+   REAL, INTENT(IN) :: ACCELERATION_FACTOR
+   INTEGER, INTENT(IN) :: ISTEP
+   IF (NTAG .EQ. 0) RETURN
+   CALL UX_AND_UY_ELLIPTICAL_KERNEL<<<BLOCKS(NTAG), TPB>>>(RB_d, IB_d, NTAG, ISTEP, ACCELERATION_FACTOR)
+END SUBROUTINE GPU_UX_AND_UY_ELLIPTICAL
 
-   IF (N == 0) RETURN ! No nodes, nothing to do
+! *****************************************************************************
+SUBROUTINE GPU_UPDATE_LOCAL_SPREAD_PROPERTIES()
+! *****************************************************************************
+   IF (NTAG .EQ. 0) RETURN
+   CALL UPDATE_LOCAL_SPREAD_PROPERTIES_KERNEL<<<BLOCKS(NTAG), TPB>>>(RB_d, IB_d, NTAG)
+END SUBROUTINE GPU_UPDATE_LOCAL_SPREAD_PROPERTIES
 
-   IF (.NOT. ALLOCATED(NORMVECTORX_h) .OR. SIZE(NORMVECTORX_h) < N) THEN ! If the host arrays are not allocated or too small, reallocate them
-       IF (ALLOCATED(NORMVECTORX_h)) DEALLOCATE(NORMVECTORX_h, NORMVECTORY_h, PHIP_OLD_h, PHIP_NBHD_h)
-       ALLOCATE(NORMVECTORX_h(N), NORMVECTORY_h(N), PHIP_OLD_h(N), PHIP_NBHD_h(5,N))
+! *****************************************************************************
+SUBROUTINE GPU_CFL_AND_FLUX_LIMITER(DT, RCELLSIZE, ISTEP, ITIMESTEP)
+! *****************************************************************************
+! Mirrors CFL_AND_FLUX_LIMITER: flux-limited gradients on the device and, on
+! ISTEP 1 after timestep 5, a max-reduction of |UX|,|UY| to update DT on host.
+   REAL, INTENT(INOUT) :: DT
+   REAL, INTENT(IN) :: RCELLSIZE
+   INTEGER, INTENT(IN) :: ISTEP, ITIMESTEP
+   INTEGER :: I, N, NB
+   REAL :: UMAX, CFL
+
+   N = NTAG
+   UMAX = 0.
+
+   IF (N .GT. 0) THEN
+      NB = BLOCKS(N)
+
+      IF (ISTEP .EQ. 1 .AND. ITIMESTEP .GT. 5) THEN
+         !$cuf kernel do(1) <<< *, * >>> reduce(max:UMAX)
+         DO I = 1, N
+            IF (IB_d(I + (KI_BURNED-1)*N) .EQ. 0) &
+               UMAX = MAX(UMAX, MAX(ABS(RB_d(I + (K_UX-1)*N)), ABS(RB_d(I + (K_UY-1)*N))))
+         ENDDO
+      ENDIF
+
+      CALL LIMITER_CANDIDATES_KERNEL<<<NB, TPB>>>(RB_d, IB_d, N, LIM_VAL_d, LIM_IDX_d)
+      CALL LIMITER_BLOCK_SCAN_KERNEL<<<dim3(NB,4,1), TPB>>>(LIM_IDX_d, LIM_BLK_d, N, NB)
+      CALL LIMITER_CARRY_SCAN_KERNEL<<<1, 4>>>(LIM_BLK_d, NB)
+      CALL LIMITER_APPLY_KERNEL<<<NB, TPB>>>(RB_d, N, NB, LIM_VAL_d, LIM_IDX_d, LIM_BLK_d, RCELLSIZE)
+      CALL LIMITER_SAVE_CARRY_KERNEL<<<1, 4>>>(N, NB, LIM_VAL_d, LIM_IDX_d, LIM_BLK_d)
    ENDIF
 
-   ! DLL to SoA of PHIP values
-   C => LIST_TAGGED%HEAD
-   DO I = 1, N
-      PHIP_NBHD_h(1,I) = PHIP(C%IX-1, C%IY)   ! W
-      PHIP_NBHD_h(2,I) = PHIP(C%IX+1, C%IY)   ! E
-      PHIP_NBHD_h(3,I) = PHIP(C%IX,   C%IY-1) ! S
-      PHIP_NBHD_h(4,I) = PHIP(C%IX,   C%IY+1) ! N
-      PHIP_NBHD_h(5,I) = PHIP(C%IX,   C%IY)   ! C
-      C => C%NEXT
-   ENDDO
-
-   ! Allocate device arrays if not allocated or if N has changed
-   IF (CALC_NORMAL_N_d < N) THEN
-      IF (ALLOCATED(NORMVECTORX_d)) DEALLOCATE(NORMVECTORX_d, NORMVECTORY_d, PHIP_OLD_d, PHIP_NBHD_d)
-      ALLOCATE(NORMVECTORX_d(N), NORMVECTORY_d(N), PHIP_OLD_d(N), PHIP_NBHD_d(5,N))
-      CALC_NORMAL_N_d = N
+   IF (ISTEP .EQ. 1 .AND. ITIMESTEP .GT. 5) THEN
+      CFL = UMAX * DT / ANALYSIS_CELLSIZE
+      IF (CFL .GT. 0.) THEN
+         DT = MIN(TARGET_CFL * DT / CFL, SIMULATION_DTMAX)
+      ELSE
+         DT = SIMULATION_DTMAX
+      ENDIF
    ENDIF
 
-   ! Copy to device arrays
-   PHIP_NBHD_d(1:5,1:N) = PHIP_NBHD_h(1:5,1:N)
+END SUBROUTINE GPU_CFL_AND_FLUX_LIMITER
 
-   ! Launch calc normal vectors kernel
-   DIM_BLOCK = dim3(256, 1, 1)
-   DIM_GRID = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1) ! Grid stride loop revisar
-   CALL CALC_NORMAL_VECTORS_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( PHIP_NBHD_d, NORMVECTORX_d,&
-    NORMVECTORY_d, PHIP_OLD_d, N, ISTEP, HALFRCELLSIZE )
+! *****************************************************************************
+SUBROUTINE GPU_RK2_INTEGRATE(DT, ISTEP)
+! *****************************************************************************
+   REAL, INTENT(IN) :: DT
+   INTEGER, INTENT(IN) :: ISTEP
+   IF (NTAG .EQ. 0) RETURN
+   CALL RK2_INTEGRATE_KERNEL<<<BLOCKS(NTAG), TPB>>>(RB_d, IB_d, NTAG, ISTEP, DT)
+END SUBROUTINE GPU_RK2_INTEGRATE
 
-   ! Check for any CUDA errors, and synchronize the device to ensure all threads have completed
-   CUDA_ERR = cudaDeviceSynchronize()
+! *****************************************************************************
+! Host helpers
+! *****************************************************************************
 
-   ! Copy results from device to host
-   NORMVECTORX_h(1:N) = NORMVECTORX_d(1:N)
-   NORMVECTORY_h(1:N) = NORMVECTORY_d(1:N)
-   IF (ISTEP == 1) PHIP_OLD_h(1:N) = PHIP_OLD_d(1:N)
+INTEGER FUNCTION BLOCKS(N)
+   INTEGER, INTENT(IN) :: N
+   BLOCKS = (N + TPB - 1) / TPB
+END FUNCTION BLOCKS
 
-   ! Update the linked list with the new normal vectors and PHIP_OLD values
-   C => LIST_TAGGED%HEAD
-   DO I = 1, N
-      C%NORMVECTORX = NORMVECTORX_h(I)
-      C%NORMVECTORY = NORMVECTORY_h(I)
-      IF (ISTEP == 1) C%PHIP_OLD = PHIP_OLD_h(I)
-      C => C%NEXT
+! *****************************************************************************
+SUBROUTINE ENSURE_CAPACITY(N)
+! *****************************************************************************
+! Grows (never shrinks) the SoA and limiter buffers, with 50% headroom.
+   INTEGER, INTENT(IN) :: N ! Number of nodes in list_tagged
+   INTEGER :: NEWCAP, NEWBLK ! New capacity and new blocks
+
+   IF (N .GT. CAP) THEN ! If the number of nodes exceeds the current capacity, grow the buffers 50% (or to 1024 if the current capacity is smaller)
+      NEWCAP = MAX(N + N / 2, 1024)
+      IF (ALLOCATED(RB_h)) DEALLOCATE(RB_h, IB_h, RB_d, IB_d, LIM_VAL_d, LIM_IDX_d)
+      ALLOCATE(RB_h(NEWCAP*NR), IB_h(NEWCAP*NI), RB_d(NEWCAP*NR), IB_d(NEWCAP*NI))
+      ALLOCATE(LIM_VAL_d(NEWCAP*4), LIM_IDX_d(NEWCAP*4))
+      RB_h(:) = 0.
+      CAP = NEWCAP
+   ENDIF
+
+   NEWBLK = BLOCKS(CAP)
+   IF (NEWBLK .GT. CAP_BLK) THEN
+      IF (ALLOCATED(LIM_BLK_d)) DEALLOCATE(LIM_BLK_d)
+      ALLOCATE(LIM_BLK_d(NEWBLK*4))
+      CAP_BLK = NEWBLK
+   ENDIF
+
+   IF (.NOT. LIM_CARRY_INIT) THEN
+      LIM_CARRY_d(:) = 1.0 ! Initial value of P<HIEAST/PHIWEST/PHINORTH/PHISOUTH in the CPU code
+      LIM_CARRY_INIT = .TRUE.
+   ENDIF
+END SUBROUTINE ENSURE_CAPACITY
+
+! *****************************************************************************
+SUBROUTINE SYNC_PHIP()
+! *****************************************************************************
+! Phase 1: full upload of PHIP at the start of a case, otherwise only the
+! cells the host wrote since the last timestep.
+   INTEGER :: K
+
+   IF (PHIP_FULL_SYNC) THEN
+      IF (ALLOCATED(PHIP_d)) THEN
+         IF (ANY(LBOUND(PHIP_d) .NE. LBOUND(PHIP)) .OR. ANY(UBOUND(PHIP_d) .NE. UBOUND(PHIP))) DEALLOCATE(PHIP_d)
+      ENDIF
+      IF (.NOT. ALLOCATED(PHIP_d)) &
+         ALLOCATE(PHIP_d(LBOUND(PHIP,1):UBOUND(PHIP,1), LBOUND(PHIP,2):UBOUND(PHIP,2)))
+      PHIP_d = PHIP
+      PHIP_FULL_SYNC = .FALSE.
+      NDIRTY = 0
+      RETURN
+   ENDIF
+
+   IF (NDIRTY .EQ. 0) RETURN
+
+   IF (.NOT. ALLOCATED(DIRTY_VAL_h)) THEN
+      ALLOCATE(DIRTY_IXY_h(2*SIZE(DIRTY_IX)), DIRTY_VAL_h(SIZE(DIRTY_IX)))
+      ALLOCATE(DIRTY_IXY_d(2*SIZE(DIRTY_IX)), DIRTY_VAL_d(SIZE(DIRTY_IX)))
+   ELSE IF (SIZE(DIRTY_VAL_h) .LT. NDIRTY) THEN
+      DEALLOCATE(DIRTY_IXY_h, DIRTY_VAL_h, DIRTY_IXY_d, DIRTY_VAL_d)
+      ALLOCATE(DIRTY_IXY_h(2*SIZE(DIRTY_IX)), DIRTY_VAL_h(SIZE(DIRTY_IX)))
+      ALLOCATE(DIRTY_IXY_d(2*SIZE(DIRTY_IX)), DIRTY_VAL_d(SIZE(DIRTY_IX)))
+   ENDIF
+
+   DO K = 1, NDIRTY
+      DIRTY_IXY_h(2*K-1) = DIRTY_IX(K)
+      DIRTY_IXY_h(2*K  ) = DIRTY_IY(K)
+      DIRTY_VAL_h(K)     = PHIP(DIRTY_IX(K), DIRTY_IY(K)) ! Latest host value
    ENDDO
+   DIRTY_IXY_d(1:2*NDIRTY) = DIRTY_IXY_h(1:2*NDIRTY)
+   DIRTY_VAL_d(1:NDIRTY)   = DIRTY_VAL_h(1:NDIRTY)
+   CALL SCATTER_PHIP_KERNEL<<<BLOCKS(NDIRTY), TPB>>>(DIRTY_IXY_d, DIRTY_VAL_d, NDIRTY)
+   NDIRTY = 0
+
+END SUBROUTINE SYNC_PHIP
 
 ! *****************************************************************************
-END SUBROUTINE CALC_NORMAL_VECTORS_CUDA
+SUBROUTINE UPLOAD_STATIC()
+! *****************************************************************************
+! Rasters, lookup tables and scalar parameters used by the kernels. Done once
+! per case because PERTURB_RASTERS may change the rasters between cases.
+   REAL, ALLOCATABLE :: TR_h(:,:), WC_h(:), BI_h(:), TMP(:,:)
+   INTEGER :: I, J
+
+   ! Module device arrays are (re)allocated here directly, not through a dummy
+   ! argument: allocating them via a dummy leaves the descriptor seen by the
+   ! kernels unset (illegal address in the kernel).
+   CALL RASTER_TO_HOST(ASP%R4, TMP)
+   IF (ALLOCATED(ASP_d)) DEALLOCATE(ASP_d)
+   ALLOCATE(ASP_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); ASP_d = TMP
+   CALL RASTER_TO_HOST(OMCOSSLPRAD%R4, TMP)
+   IF (ALLOCATED(OMCOSSLPRAD_d)) DEALLOCATE(OMCOSSLPRAD_d)
+   ALLOCATE(OMCOSSLPRAD_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); OMCOSSLPRAD_d = TMP
+   CALL RASTER_TO_HOST(CBD%R4, TMP)
+   IF (ALLOCATED(CBD_d)) DEALLOCATE(CBD_d)
+   ALLOCATE(CBD_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); CBD_d = TMP
+   CALL RASTER_TO_HOST(CC%R4, TMP)
+   IF (ALLOCATED(CC_d)) DEALLOCATE(CC_d)
+   ALLOCATE(CC_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); CC_d = TMP
+   CALL RASTER_TO_HOST(CH%R4, TMP)
+   IF (ALLOCATED(CH_d)) DEALLOCATE(CH_d)
+   ALLOCATE(CH_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); CH_d = TMP
+   CALL RASTER_TO_HOST(CBH%R4, TMP)
+   IF (ALLOCATED(CBH_d)) DEALLOCATE(CBH_d)
+   ALLOCATE(CBH_d(LBOUND(TMP,1):UBOUND(TMP,1), LBOUND(TMP,2):UBOUND(TMP,2))); CBH_d = TMP
+   DEALLOCATE(TMP)
+
+   SINASPM180_d = SINASPM180
+   COSASPM180_d = COSASPM180
+   ABSSINASP_d  = ABSSINASP
+   ABSCOSASP_d  = ABSCOSASP
+
+   ALLOCATE(TR_h(0:303,30:120), WC_h(0:303), BI_h(0:303))
+   DO J = 30, 120
+   DO I = 0, 303
+      TR_h(I,J) = FUEL_MODEL_TABLE_2D(I,J)%TR
+   ENDDO
+   ENDDO
+   DO I = 0, 303
+      WC_h(I) = FUEL_MODEL_TABLE_2D(I,30)%WSMFEFF_COEFF
+      BI_h(I) = FUEL_MODEL_TABLE_2D(I,30)%B_COEFF_INVERSE
+   ENDDO
+   TR_d              = TR_h
+   WSMFEFF_COEFF_d   = WC_h
+   B_COEFF_INVERSE_d = BI_h
+   DEALLOCATE(TR_h, WC_h, BI_h)
+
+   G_PHIS_ADJ                     = PHIS_ADJ
+   G_PHIW_ADJ                     = PHIW_ADJ
+   G_WSMFEFF_LOW_MULT             = WSMFEFF_LOW_MULT
+   G_MAX_LOW                      = MAX_LOW
+   G_PERTURB_CBD                  = PERTURB_CBD
+   G_PERTURB_CBH                  = PERTURB_CBH
+   G_CROWN_FIRE_ADJ               = CROWN_FIRE_ADJ
+   G_CROWN_FIRE_SPREAD_RATE_LIMIT = CROWN_FIRE_SPREAD_RATE_LIMIT
+   G_CRITICAL_CANOPY_COVER        = CRITICAL_CANOPY_COVER
+   G_ASP_CELLSIZE                 = ASP%CELLSIZE
+   G_ANALYSIS_CELLSIZE            = ANALYSIS_CELLSIZE
+   G_CROWN_FIRE_MODEL             = CROWN_FIRE_MODEL
+   G_NO_SURFACE_FIRE              = NO_SURFACE_FIRE
+   G_UMD_DURATION                 = (.NOT. USE_SUPERSEDED_SPOTTING) .AND. USE_PHYSICAL_SPOTTING_DURATION .AND. ENABLE_SPOTTING
+
+   STATIC_SYNC = .FALSE.
+
+END SUBROUTINE UPLOAD_STATIC
+
+! *****************************************************************************
+SUBROUTINE RASTER_TO_HOST(R4, TMP)
+! *****************************************************************************
+! Contiguous host copy of band 1 of a raster, keeping its bounds. An
+! unassociated raster (not read by the CPU code either) becomes a 1x1 zero.
+   REAL, POINTER, DIMENSION(:,:,:) :: R4
+   REAL, ALLOCATABLE, INTENT(INOUT) :: TMP(:,:)
+
+   IF (ALLOCATED(TMP)) DEALLOCATE(TMP)
+   IF (.NOT. ASSOCIATED(R4)) THEN
+      ALLOCATE(TMP(1,1)); TMP = 0.
+      RETURN
+   ENDIF
+   ALLOCATE(TMP(LBOUND(R4,1):UBOUND(R4,1), LBOUND(R4,2):UBOUND(R4,2)))
+   TMP(:,:) = R4(:,:,LBOUND(R4,3))
+END SUBROUTINE RASTER_TO_HOST
+
+! *****************************************************************************
+! Kernels
 ! *****************************************************************************
 
 ! *****************************************************************************
-! Kernel to calculate the normal vectors of the nodes in the tagged list
-ATTRIBUTES (GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL( PHIP_NBHD, NORMVECTORX, NORMVECTORY, PHIP_OLD, N, ISTEP, HALFRCELLSIZE)
+ATTRIBUTES(GLOBAL) SUBROUTINE SCATTER_PHIP_KERNEL(IXY, VAL, M)
 ! *****************************************************************************
+   INTEGER, VALUE :: M
+   INTEGER, DEVICE :: IXY(2*M)
+   REAL, DEVICE :: VAL(M)
+   INTEGER :: K
+   K = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (K > M) RETURN
+   PHIP_d(IXY(2*K-1), IXY(2*K)) = VAL(K) ! Duplicates carry the same host value
+END SUBROUTINE SCATTER_PHIP_KERNEL
 
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE GATHER_PHIP_KERNEL(RB, IB, N)
+! *****************************************************************************
+   INTEGER, VALUE :: N
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, DEVICE :: IB(N,NI)
+   INTEGER :: I
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   RB(I,K_PHIP) = PHIP_d(IB(I,KI_IX), IB(I,KI_IY))
+END SUBROUTINE GATHER_PHIP_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE CALC_NORMAL_VECTORS_KERNEL(RB, IB, N, ISTEP, HALFRCELLSIZE)
+! *****************************************************************************
+! Mirrors CALC_NORMAL_VECTORS, reading the neighbours straight from PHIP_d.
    INTEGER, VALUE :: N, ISTEP
    REAL, VALUE :: HALFRCELLSIZE
-   REAL, DEVICE :: PHIP_NBHD(5,N)
-   REAL, DEVICE :: NORMVECTORX(N), NORMVECTORY(N), PHIP_OLD(N)
-
-   INTEGER :: I
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, DEVICE :: IB(N,NI)
+   INTEGER :: I, IX, IY
    REAL :: DPHIDX, DPHIDY, RMAGGRADPHI
    REAL, PARAMETER :: EPSILON = 1E-30, BIG = 3E4
 
-   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x ! Index of the current thread in GPU
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   IX = IB(I,KI_IX)
+   IY = IB(I,KI_IY)
 
-   IF (I > N) RETURN ! Avoid out-of-bounds threads from doing any work
+   IF (ISTEP .EQ. 1) RB(I,K_PHIP_OLD) = PHIP_d(IX,IY)
+   DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP_d(IX,IY+1) - PHIP_d(IX,IY-1)), BIG ), -BIG)
+   DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP_d(IX+1,IY) - PHIP_d(IX-1,IY)), BIG ), -BIG)
+   RMAGGRADPHI = 1. / MAX(SQRT( DPHIDX * DPHIDX + DPHIDY * DPHIDY ), EPSILON)
+   RB(I,K_NVY) = RMAGGRADPHI * DPHIDY
+   RB(I,K_NVX) = RMAGGRADPHI * DPHIDX
 
-   IF (ISTEP .EQ. 1) THEN
-      PHIP_OLD(I) = PHIP_NBHD(5,I)
-      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(4,I) - PHIP_NBHD(3,I)), BIG ), -BIG)
-      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(2,I) - PHIP_NBHD(1,I)), BIG ), -BIG)
-   ELSE
-      DPHIDX = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(2,I) - PHIP_NBHD(1,I)), BIG ), -BIG)
-      DPHIDY = MAX(MIN( HALFRCELLSIZE * (PHIP_NBHD(4,I) - PHIP_NBHD(3,I)), BIG ), -BIG)
-   ENDIF
-
-   RMAGGRADPHI = 1. / MAX(SQRT( DPHIDX * DPHIDX + DPHIDY * DPHIDY ), EPSILON)·
-
-   NORMVECTORX(I) = RMAGGRADPHI * DPHIDX
-   NORMVECTORY(I) = RMAGGRADPHI * DPHIDY
-
-! *****************************************************************************
 END SUBROUTINE CALC_NORMAL_VECTORS_KERNEL
-! *****************************************************************************
 
 ! *****************************************************************************
-! CUDA version of the 2nd order Runge-Kutta integration of PHIP, this is the wrapper
-SUBROUTINE RK2_INTEGRATE_CUDA(DT, ISTEP)
+ATTRIBUTES(DEVICE) SUBROUTINE COMPUTE_SPREAD_VELOCITIES_DEV(RB, N, I, IFBFM, ILH_OUT)
 ! *****************************************************************************
+! Mirrors COMPUTE_SPREAD_VELOCITIES (Rothermel branch).
+   INTEGER, VALUE :: N, I, IFBFM
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, INTENT(OUT) :: ILH_OUT
+   REAL :: COSANG, SINANG, A, B, AACOSANG, BBSINANG, DENOM, RDENOM, DYDT, DXDT, DXDT_ROTATED, DYDT_ROTATED
+   REAL :: NVX, NVY, NVX_DMS, NVY_DMS, VDMS, VBACK, UX, UY, VEL, SDIR
 
-   REAL, INTENT(IN) :: DT
-   INTEGER, INTENT(IN) :: ISTEP
-   INTEGER :: I, N
-   TYPE(NODE), POINTER :: C
-   TYPE(dim3) :: DIM_GRID, DIM_BLOCK
+   NVX     = RB(I,K_NVX)
+   NVY     = RB(I,K_NVY)
+   NVX_DMS = RB(I,K_NVX_DMS)
+   NVY_DMS = RB(I,K_NVY_DMS)
+   VDMS    = RB(I,K_VELOCITY_DMS)
+   VBACK   = RB(I,K_VBACK)
 
-   N = LIST_TAGGED%NUM_NODES ! Get the number of nodes in the tagged list
+   COSANG   = NVY*NVY_DMS + NVX*NVX_DMS
+   A        = MAX(0.5 * (VDMS + VBACK), 1E-10)
+   AACOSANG = A*A*COSANG
 
-   IF (N == 0) RETURN ! No nodes, nothing to do
+   SINANG   = NVX*NVY_DMS - NVY*NVX_DMS
+   B        = 0.5 * MAX( (VDMS + VBACK) / RB(I,K_LOW), 1E-10)
+   BBSINANG = B*B*SINANG
 
-   IF (.NOT. ALLOCATED(RK2_PHIP_OLD_h) .OR. SIZE(RK2_PHIP_OLD_h) < N) THEN ! If the host arrays are not allocated or too small, reallocate them
-      IF (ALLOCATED(RK2_PHIP_OLD_h)) DEALLOCATE(RK2_PHIP_OLD_h, RK2_UX_h, RK2_UY_h, &
-         RK2_DPHIDX_LIMITED_h, RK2_DPHIDY_LIMITED_h, RK2_PHIP_NOW_h, RK2_PHIP_NEW_h, RK2_WTU_SPREAD_h)
-      ALLOCATE(RK2_PHIP_OLD_h(N), RK2_UX_h(N), RK2_UY_h(N), &
-         RK2_DPHIDX_LIMITED_h(N), RK2_DPHIDY_LIMITED_h(N), RK2_PHIP_NOW_h(N), RK2_PHIP_NEW_h(N), RK2_WTU_SPREAD_h(N))
-   ENDIF
+   DENOM    = MAX(SQRT(AACOSANG*COSANG + BBSINANG*SINANG),1E-10)
+   RDENOM   = 1. / DENOM
 
-   ! DLL to SoA
-   C => LIST_TAGGED%HEAD
-   DO I = 1, N
-      RK2_PHIP_OLD_h(I)       = C%PHIP_OLD
-      RK2_UX_h(I)             = C%UX
-      RK2_UY_h(I)             = C%UY
-      RK2_DPHIDX_LIMITED_h(I) = C%DPHIDX_LIMITED
-      RK2_DPHIDY_LIMITED_h(I) = C%DPHIDY_LIMITED
-      RK2_WTU_SPREAD_h(I)     = C%WTU_SPREAD
-      IF (ISTEP == 2) RK2_PHIP_NOW_h(I) = PHIP(C%IX, C%IY) ! ISTEP=2 needs the current on-grid value; kernel cannot read PHIP directly
-      C => C%NEXT
-   ENDDO
+   DYDT     = (RDENOM * AACOSANG ) + 0.5 * (VDMS - VBACK)
+   DXDT     = RDENOM * BBSINANG
 
-   ! Allocate device arrays if not allocated or if N has changed
-   IF (RK2_N_d < N) THEN
-      IF (ALLOCATED(RK2_PHIP_OLD_d)) DEALLOCATE(RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
-         RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, RK2_WTU_SPREAD_d)
-      ALLOCATE(RK2_PHIP_OLD_d(N), RK2_UX_d(N), RK2_UY_d(N), &
-         RK2_DPHIDX_LIMITED_d(N), RK2_DPHIDY_LIMITED_d(N), RK2_PHIP_NOW_d(N), RK2_PHIP_NEW_d(N), RK2_WTU_SPREAD_d(N))
-      RK2_N_d = N
-   ENDIF
+   DXDT_ROTATED = DYDT*NVX_DMS + DXDT*NVY_DMS
+   UX           = DXDT_ROTATED * RB(I,K_UXOUSX) * FTPMIN_TO_MPS
 
-   ! Copy to device arrays
-   RK2_PHIP_OLD_d(1:N)       = RK2_PHIP_OLD_h(1:N)
-   RK2_UX_d(1:N)             = RK2_UX_h(1:N)
-   RK2_UY_d(1:N)             = RK2_UY_h(1:N)
-   RK2_DPHIDX_LIMITED_d(1:N) = RK2_DPHIDX_LIMITED_h(1:N)
-   RK2_DPHIDY_LIMITED_d(1:N) = RK2_DPHIDY_LIMITED_h(1:N)
-   RK2_WTU_SPREAD_d(1:N)     = RK2_WTU_SPREAD_h(1:N)
-   IF (ISTEP == 2) RK2_PHIP_NOW_d(1:N) = RK2_PHIP_NOW_h(1:N)
+   DYDT_ROTATED = DYDT*NVY_DMS - DXDT*NVX_DMS
+   UY           = DYDT_ROTATED * RB(I,K_UYOUSY) * FTPMIN_TO_MPS
+   VEL          = SQRT(DXDT_ROTATED*DXDT_ROTATED + DYDT_ROTATED*DYDT_ROTATED)
 
-   ! Launch RK2 integration kernel
-   DIM_BLOCK = dim3(256, 1, 1)
-   DIM_GRID  = dim3(CEILING((REAL(N)) / DIM_BLOCK%x), 1, 1)
-   CALL RK2_INTEGRATE_KERNEL<<<DIM_GRID, DIM_BLOCK>>>( RK2_PHIP_OLD_d, RK2_UX_d, RK2_UY_d, &
-    RK2_DPHIDX_LIMITED_d, RK2_DPHIDY_LIMITED_d, RK2_PHIP_NOW_d, RK2_PHIP_NEW_d, RK2_WTU_SPREAD_d, N, ISTEP, DT )
+   IF (ABS(UX) + ABS(UY) .GT. 1.0e-20) THEN
+      SDIR = ATAN2(UX, UY) * 180.0 / ACOS(-1.0)
+      IF (SDIR .LT. 0.0) SDIR = SDIR + 360.0
+   ELSE
+      SDIR = 0.0
+   END IF
 
-   ! Check for any CUDA errors, and synchronize the device to ensure all threads have completed
-   CUDA_ERR = cudaDeviceSynchronize()
+   ILH_OUT = MAX(MIN(NINT(100.*RB(I,K_MLH)),120),30)
+   RB(I,K_FLIN_SURFACE) = TR_d(IFBFM,ILH_OUT) * RB(I,K_IR) * VEL * 0.3048 ! kW/m
 
-   ! Copy results from device to host
-   RK2_PHIP_NEW_h(1:N) = RK2_PHIP_NEW_d(1:N)
+   IF (G_NO_SURFACE_FIRE) THEN
+      UX = 1E-5
+      UY = 1E-5
+   END IF
 
-   ! Scatter the new PHIP values back onto the host grid at each node's position
-   C => LIST_TAGGED%HEAD
-   DO I = 1, N
-      PHIP(C%IX, C%IY) = RK2_PHIP_NEW_h(I)
-      C => C%NEXT
-   ENDDO
+   RB(I,K_UX)               = UX
+   RB(I,K_UY)               = UY
+   RB(I,K_VELOCITY)         = VEL
+   RB(I,K_SPREAD_DIRECTION) = SDIR
+
+END SUBROUTINE COMPUTE_SPREAD_VELOCITIES_DEV
 
 ! *****************************************************************************
-END SUBROUTINE RK2_INTEGRATE_CUDA
+ATTRIBUTES(GLOBAL) SUBROUTINE UX_AND_UY_ELLIPTICAL_KERNEL(RB, IB, N, ISTEP, ACCELERATION_FACTOR)
 ! *****************************************************************************
-
-! *****************************************************************************
-! Kernel to perform the 2nd order Runge-Kutta integration of PHIP for the nodes in the tagged list
-ATTRIBUTES (GLOBAL) SUBROUTINE RK2_INTEGRATE_KERNEL( PHIP_OLD, UX, UY, DPHIDX_LIMITED, DPHIDY_LIMITED, &
-                                                       PHIP_NOW, PHIP_NEW, WTU_SPREAD, N, ISTEP, DT )
-! *****************************************************************************
-
+! Mirrors UX_AND_UY_ELLIPTICAL for LIST_TAGGED (Rothermel, no building model).
    INTEGER, VALUE :: N, ISTEP
-   REAL,    VALUE :: DT
-   REAL, DEVICE :: PHIP_OLD(N), UX(N), UY(N), DPHIDX_LIMITED(N), DPHIDY_LIMITED(N)
-   REAL, DEVICE :: PHIP_NOW(N), PHIP_NEW(N)
-   LOGICAL, DEVICE :: WTU_SPREAD(N)
+   REAL, VALUE :: ACCELERATION_FACTOR
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, DEVICE :: IB(N,NI)
+   INTEGER :: I, IX, IY, IASP, ILH, NITER, IFBFM
+   REAL :: PHIMAG, PHIWX, PHIWY, PHIX, PHIY, WSMFEFF, BOH, APHIS, APHIW, RPHIMAG, SQRT_LOW2_M1, LOW, &
+           VDMS, LOCAL_SPREAD_SPEED
+   LOGICAL :: DONE, CROWN_FIRE_AT_START, CROWN_FIRE_AT_END
 
-   REAL, PARAMETER :: LIMIT = 1.0 ! Same clamp as CPU RK2_INTEGRATE
-   INTEGER :: I
-
-   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x ! Index of the current thread in GPU
-
-   IF (I > N) RETURN ! Avoid out-of-bounds threads from doing any work
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   IF (IB(I,KI_BURNED) .NE. 0) RETURN
+   IFBFM = IB(I,KI_IFBFM)
 
    IF (ISTEP .EQ. 1) THEN
-      PHIP_NEW(I) = PHIP_OLD(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))
-      IF ( PHIP_NEW(I) .NE. PHIP_NEW(I) ) PHIP_NEW(I) = 1.0 ! NaN check
-      IF ( PHIP_NEW(I) .LT. -1 * LIMIT )  PHIP_NEW(I) = -1 * LIMIT
-      IF ( PHIP_NEW(I) .GT.  LIMIT )      PHIP_NEW(I) =  LIMIT
-   ELSE
-      PHIP_NEW(I) = 0.5 * (PHIP_OLD(I) + (PHIP_NOW(I) - DT * (UX(I) * DPHIDX_LIMITED(I) + UY(I) * DPHIDY_LIMITED(I))))
+
+      IF (IB(I,KI_NEED_SLOPE_CALC) .NE. 0) THEN
+         IX = IB(I,KI_IX)
+         IY = IB(I,KI_IY)
+         IASP  = MIN(MAX(NINT(ASP_d(IX,IY)),0),360)
+         APHIS = ACCELERATION_FACTOR * G_PHIS_ADJ * RB(I,K_PHIS_SURFACE)
+         RB(I,K_PHISX)  = APHIS * SINASPM180_d(IASP)
+         RB(I,K_PHISY)  = APHIS * COSASPM180_d(IASP)
+         RB(I,K_UXOUSX) = 1. - ABSSINASP_d(IASP) * OMCOSSLPRAD_d(IX,IY)
+         RB(I,K_UYOUSY) = 1. - ABSCOSASP_d(IASP) * OMCOSSLPRAD_d(IX,IY)
+         IB(I,KI_NEED_SLOPE_CALC) = 0
+      ENDIF
+
+      DONE  = .FALSE.
+      NITER = 0
+      DO WHILE (.NOT. DONE)
+         CROWN_FIRE_AT_START = .FALSE.
+         IF (G_CROWN_FIRE_MODEL .GT. 0 .AND. RB(I,K_FLIN_SURFACE) .GE. RB(I,K_CRITICAL_FLIN)) THEN
+            APHIW = G_PHIW_ADJ * MAX(RB(I,K_PHIW_SURFACE), RB(I,K_PHIW_CROWN))
+            CROWN_FIRE_AT_START = .TRUE.
+         ELSE
+            APHIW = G_PHIW_ADJ * ACCELERATION_FACTOR * RB(I,K_PHIW_SURFACE)
+         ENDIF
+
+         PHIWX = APHIW * SIN( (RB(I,K_WD20_NOW) - 180.) * PIO180)
+         PHIX  = RB(I,K_PHISX) + PHIWX
+
+         PHIWY = APHIW * COS( (RB(I,K_WD20_NOW) - 180.) * PIO180)
+         PHIY  = RB(I,K_PHISY) + PHIWY
+
+         PHIMAG = MAX(SQRT(PHIX*PHIX+PHIY*PHIY),1E-10)
+         IF (PHIMAG .LT. 1.1E-10) THEN
+            RB(I,K_NVX_DMS) = 1.0
+            RB(I,K_NVY_DMS) = 0.0
+         ELSE
+            RPHIMAG = 1. / PHIMAG
+            RB(I,K_NVX_DMS) = RPHIMAG * PHIX
+            RB(I,K_NVY_DMS) = RPHIMAG * PHIY
+         ENDIF
+         VDMS = RB(I,K_VS0) * (ACCELERATION_FACTOR + PHIMAG)
+         RB(I,K_VELOCITY_DMS) = VDMS
+
+         WSMFEFF = WSMFEFF_COEFF_d(IFBFM) * PHIMAG ** B_COEFF_INVERSE_d(IFBFM)
+         IF (RB(I,K_FLIN_SURFACE) .LT. RB(I,K_CRITICAL_FLIN) .OR. G_CROWN_FIRE_MODEL .LE. 0) &
+            WSMFEFF = MIN(WSMFEFF, 0.9*KWPM2_TO_BTUPFT2MIN*RB(I,K_IR))
+         LOW = MIN( 0.936*EXP(0.1147*WSMFEFF*G_WSMFEFF_LOW_MULT) + 0.461*EXP(-0.0692*WSMFEFF*G_WSMFEFF_LOW_MULT) - 0.397, G_MAX_LOW)
+         RB(I,K_LOW) = LOW
+
+         IF (LOW .GT. 0.999 .AND. LOW .LT. 1.001) THEN
+            BOH = 1.0
+         ELSE
+            SQRT_LOW2_M1 = SQRT(LOW*LOW - 1.0)
+            BOH = (LOW - SQRT_LOW2_M1) / (LOW + SQRT_LOW2_M1 )
+         ENDIF
+         RB(I,K_VBACK) = BOH * VDMS
+#ifdef _WUI
+         IB(I,KI_TEST_INTERFACE) = 0 ! USE_BLDG_SPREAD_MODEL is .FALSE. on this path
+         IB(I,KI_WTU_SPREAD)     = 0
+#endif
+
+         CALL COMPUTE_SPREAD_VELOCITIES_DEV(RB, N, I, IFBFM, ILH)
+
+         CROWN_FIRE_AT_END = .FALSE.
+         IF (G_CROWN_FIRE_MODEL .GT. 0 .AND. RB(I,K_FLIN_SURFACE) .GE. RB(I,K_CRITICAL_FLIN)) THEN
+            CROWN_FIRE_AT_END = .TRUE.
+         ELSE
+            IB(I,KI_CROWN_FIRE) = 0
+         ENDIF
+
+         DONE = .TRUE.
+         IF (CROWN_FIRE_AT_END .AND. (.NOT. CROWN_FIRE_AT_START)) DONE = .FALSE.
+         NITER = NITER + 1
+         IF (NITER .EQ. 2) DONE = .TRUE.
+      ENDDO
+
+   ELSE ! ISTEP .EQ. 2
+
+      CALL COMPUTE_SPREAD_VELOCITIES_DEV(RB, N, I, IFBFM, ILH)
+
+      IF (G_CROWN_FIRE_MODEL .GT. 0 .AND. RB(I,K_FLIN_SURFACE) .GE. RB(I,K_CRITICAL_FLIN)) THEN
+         RB(I,K_FLIN_CANOPY) = RB(I,K_HPUA_CANOPY) * RB(I,K_VELOCITY) * 5.08E-3
+      ELSE
+         IB(I,KI_CROWN_FIRE) = 0
+      ENDIF
+
+#ifdef _UMDSPOTTING
+      IF (G_UMD_DURATION) THEN
+         LOCAL_SPREAD_SPEED = SQRT(RB(I,K_UX)*RB(I,K_UX) + RB(I,K_UY)*RB(I,K_UY))
+         IF (LOCAL_SPREAD_SPEED > 1.0E-6) THEN
+            RB(I,K_LOCAL_EMBERGEN_DURATION) = G_ANALYSIS_CELLSIZE / LOCAL_SPREAD_SPEED
+         ELSE
+            RB(I,K_LOCAL_EMBERGEN_DURATION) = TR_d(IFBFM,ILH) * 60.0
+         ENDIF
+      ENDIF
+#endif
+
    ENDIF
 
-   IF (WTU_SPREAD(I)) PHIP_NEW(I) = -1.0 ! Interface Model (both RK2 stages)
+END SUBROUTINE UX_AND_UY_ELLIPTICAL_KERNEL
 
 ! *****************************************************************************
-END SUBROUTINE RK2_INTEGRATE_KERNEL
+ATTRIBUTES(GLOBAL) SUBROUTINE UPDATE_LOCAL_SPREAD_PROPERTIES_KERNEL(RB, IB, N)
 ! *****************************************************************************
+! Mirrors UPDATE_LOCAL_SPREAD_PROPERTIES + CROWN_CRITICAL_FLIN (Rothermel).
+! Like the CPU version it runs on every node, burned or not.
+   INTEGER, VALUE :: N
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, DEVICE :: IB(N,NI)
+   INTEGER :: I, IX, IY, IFBFM, CROWN_FIRE
+   REAL :: FME, RSC, CROS, CBD_EFF, WS10KMPH, CROSA, R0, CAC, FMCTERM, CBH_EFF, VEL, VS0, &
+           FLIN_SURFACE, FLIN_CANOPY, CRITICAL_FLIN, HPUA_CANOPY, CBD, CC
+
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   IX = IB(I,KI_IX)
+   IY = IB(I,KI_IY)
+   IFBFM        = IB(I,KI_IFBFM)
+   CROWN_FIRE   = IB(I,KI_CROWN_FIRE)
+   VEL          = RB(I,K_VELOCITY)
+   VS0          = RB(I,K_VS0)
+   FLIN_SURFACE = RB(I,K_FLIN_SURFACE)
+   FLIN_CANOPY  = RB(I,K_FLIN_CANOPY)
+   CRITICAL_FLIN= RB(I,K_CRITICAL_FLIN)
+   HPUA_CANOPY  = RB(I,K_HPUA_CANOPY)
+
+   IF (IFBFM .EQ. 6 .AND. CROWN_FIRE .GT. 0) THEN ! C-6 special condition (applied by the CPU code regardless of model)
+      FME = 1000*((1.5-0.00275*RB(I,K_FMC))**4.0)/(460+(25.9*RB(I,K_FMC)))
+      RSC = 60*(1-EXP(-0.0497*RB(I,K_ISI)))*FME/0.778
+      VEL = VEL + RB(I,K_CFB)*(RSC - VEL/3.28) * 3.28
+   ENDIF
+
+   ! CROWN_CRITICAL_FLIN
+   IF (CRITICAL_FLIN .GT. 1E9) THEN
+      HPUA_CANOPY = CBD_d(IX,IY) * MAX(CH_d(IX,IY) - CBH_d(IX,IY),0.) * 12000.
+      IF (CBH_d(IX,IY) .GE. 0.) THEN
+         FMCTERM = 460. + 26. * RB(I,K_FMC)
+         CBH_EFF = MAX(CBH_d(IX,IY) + G_PERTURB_CBH, 0.1)
+         CRITICAL_FLIN = (0.01 * CBH_EFF * FMCTERM) ** 1.5
+      ELSE
+         CRITICAL_FLIN = 9E9
+      ENDIF
+   ENDIF
+
+   IF (FLIN_SURFACE .LT. CRITICAL_FLIN .OR. G_CROWN_FIRE_MODEL .LE. 0) THEN
+      CROWN_FIRE  = 0
+      FLIN_CANOPY = 0
+   ELSE
+      CBD = CBD_d(IX,IY)
+      CC  = CC_d(IX,IY)
+      IF (VS0 .GT. 0. .AND. CBD .GT. 1E-3 .AND. CC .GT. 1E-3) THEN
+         FLIN_CANOPY = HPUA_CANOPY * VEL * 5.08E-3
+         CROS = 0.
+         CBD_EFF  = MAX(CBD + G_PERTURB_CBD, 0.01)
+         WS10KMPH = RB(I,K_WS20_NOW) * MPH_20FT_TO_KMPH_10M
+         CROSA    = G_CROWN_FIRE_ADJ * 11.02 * WS10KMPH**0.9 * CBD_EFF**0.19 * EXP(-0.17*100.0*RB(I,K_M1)) / 0.3048
+         CROSA    = MIN(CROSA,G_CROWN_FIRE_SPREAD_RATE_LIMIT)
+         R0       = (3.0 / CBD_EFF) / 0.3048
+         CAC      = CROSA / R0
+         IF (CAC .GT. 1) THEN
+            IF (CC .GE. G_CRITICAL_CANOPY_COVER) THEN
+               CROWN_FIRE = 2
+               CROS = CROSA
+               RB(I,K_PHIW_CROWN) = MIN(MAX(CROS / MAX(VS0, 0.001) - 1.0, 0.0), 200.0)
+            ELSE
+               CROWN_FIRE = 1
+            ENDIF
+         ELSE
+            CROWN_FIRE = 1
+            IF (CC .GE. G_CRITICAL_CANOPY_COVER) THEN
+               CROS = CROSA * EXP(-CAC)
+               RB(I,K_PHIW_CROWN) = MIN(MAX(CROS / MAX(VS0,0.001) - 1.0, 0.0), 200.0)
+            ENDIF
+         ENDIF
+      ENDIF
+   ENDIF
+
+   RB(I,K_VELOCITY)      = VEL
+   RB(I,K_FLIN_CANOPY)   = FLIN_CANOPY
+   RB(I,K_CRITICAL_FLIN) = CRITICAL_FLIN
+   RB(I,K_HPUA_CANOPY)   = HPUA_CANOPY
+   RB(I,K_FLAME_LENGTH)  = (0.0775 / 0.3048) * (FLIN_SURFACE + FLIN_CANOPY) ** 0.46
+   RB(I,K_HRRPUA)        = (FLIN_SURFACE + FLIN_CANOPY) / G_ASP_CELLSIZE
+   IB(I,KI_CROWN_FIRE)   = CROWN_FIRE
+
+END SUBROUTINE UPDATE_LOCAL_SPREAD_PROPERTIES_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(DEVICE) REAL FUNCTION HALF_SUPERBEE_DEV(R)
+! *****************************************************************************
+   REAL, VALUE :: R
+   HALF_SUPERBEE_DEV = MAX(0.,MAX(MIN(0.5*R,1.),MIN(R,0.5)))
+END FUNCTION HALF_SUPERBEE_DEV
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE LIMITER_CANDIDATES_KERNEL(RB, IB, N, VAL, IDX)
+! *****************************************************************************
+! Pass 1 of LIMIT_GRADIENTS: for each of PHIEAST(1), PHIWEST(2), PHINORTH(3)
+! and PHISOUTH(4), the value this node assigns (if any) and IDX = I when it
+! assigns one, 0 when the CPU code would keep the SAVEd value.
+   INTEGER, VALUE :: N
+   REAL, DEVICE :: RB(N,NR), VAL(N,4)
+   INTEGER, DEVICE :: IB(N,NI), IDX(N,4)
+   INTEGER :: I, IX, IY
+   REAL :: DELTAUP, DELTALOC
+   REAL, PARAMETER :: EPSILON = 1E-30
+
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   IX = IB(I,KI_IX)
+   IY = IB(I,KI_IY)
+   IDX(I,1:4) = 0
+   VAL(I,1:4) = 0.
+
+   IF (RB(I,K_UX) .GE. 0E0) THEN
+      DELTAUP  = PHIP_d(IX,  IY) - PHIP_d(IX-1,IY)
+      DELTALOC = PHIP_d(IX+1,IY) - PHIP_d(IX  ,IY)
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         VAL(I,1) = PHIP_d(IX,IY) + HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,1) = I
+      ENDIF
+      DELTALOC = -DELTAUP
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         DELTAUP = PHIP_d(IX-2,IY) - PHIP_d(IX-1,IY)
+         VAL(I,2) = PHIP_d(IX-1,IY) - HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,2) = I
+      ENDIF
+   ELSE
+      DELTALOC = PHIP_d(IX+1,IY) - PHIP_d(IX, IY)
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         DELTAUP  = PHIP_d(IX+2,IY) - PHIP_d(IX+1,IY)
+         VAL(I,1) = PHIP_d(IX+1,IY) - HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,1) = I
+      ENDIF
+      DELTAUP  = -DELTALOC
+      DELTALOC = PHIP_d(IX-1,IY) - PHIP_d(IX,IY)
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         VAL(I,2) = PHIP_d(IX,IY) + HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,2) = I
+      ENDIF
+   ENDIF
+
+   IF (RB(I,K_UY) .GT. 0E0) THEN
+      DELTAUP  = PHIP_d(IX,IY  ) - PHIP_d(IX,IY-1)
+      DELTALOC = PHIP_d(IX,IY+1) - PHIP_d(IX,IY  )
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         VAL(I,3) = PHIP_d(IX,IY) + HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,3) = I
+      ENDIF
+      DELTALOC = -DELTAUP
+      IF (ABS(DELTALOC) .GT. EPSILON) THEN
+         DELTAUP  = PHIP_d(IX,IY-2) - PHIP_d(IX,IY-1)
+         VAL(I,4) = PHIP_d(IX,IY-1) - HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,4) = I
+      ENDIF
+   ELSE
+      DELTALOC = PHIP_d(IX,IY+1) - PHIP_d(IX,IY  )
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         DELTAUP  = PHIP_d(IX,IY+2) - PHIP_d(IX,IY+1)
+         VAL(I,3) = PHIP_d(IX,IY+1) - HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,3) = I
+      ENDIF
+      DELTAUP  = -DELTALOC
+      DELTALOC = PHIP_d(IX,IY-1) - PHIP_d(IX,IY)
+      IF (ABS(DELTALOC) > EPSILON) THEN
+         VAL(I,4) = PHIP_d(IX,IY) + HALF_SUPERBEE_DEV(DELTAUP / DELTALOC)*DELTALOC
+         IDX(I,4) = I
+      ENDIF
+   ENDIF
+
+END SUBROUTINE LIMITER_CANDIDATES_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE LIMITER_BLOCK_SCAN_KERNEL(IDX, BLK, N, NB)
+! *****************************************************************************
+! Pass 2: inclusive max-scan of IDX inside each block of TPB nodes (one
+! variable per blockIdx%y); the block total goes to BLK.
+   INTEGER, VALUE :: N, NB
+   INTEGER, DEVICE :: IDX(N,4), BLK(NB,4)
+   INTEGER, SHARED :: S(TPB)
+   INTEGER :: I, T, V, OFF, X
+
+   T = threadIdx%x
+   V = blockIdx%y
+   I = (blockIdx%x - 1) * TPB + T
+   IF (I <= N) THEN
+      S(T) = IDX(I,V)
+   ELSE
+      S(T) = 0
+   ENDIF
+   CALL SYNCTHREADS()
+
+   OFF = 1
+   DO WHILE (OFF < TPB)
+      IF (T > OFF) THEN
+         X = S(T-OFF)
+      ELSE
+         X = 0
+      ENDIF
+      CALL SYNCTHREADS()
+      S(T) = MAX(S(T), X)
+      CALL SYNCTHREADS()
+      OFF = 2 * OFF
+   ENDDO
+
+   IF (I <= N) IDX(I,V) = S(T)
+   IF (T == TPB) BLK(blockIdx%x,V) = S(TPB)
+
+END SUBROUTINE LIMITER_BLOCK_SCAN_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE LIMITER_CARRY_SCAN_KERNEL(BLK, NB)
+! *****************************************************************************
+! Pass 3: exclusive max-scan of the block totals (one thread per variable),
+! so BLK(B,V) becomes the last valid index in blocks 1..B-1.
+   INTEGER, VALUE :: NB
+   INTEGER, DEVICE :: BLK(NB,4)
+   INTEGER :: B, V, RUN, X
+
+   V = threadIdx%x
+   IF (V > 4) RETURN
+   RUN = 0
+   DO B = 1, NB
+      X = BLK(B,V)
+      BLK(B,V) = RUN
+      RUN = MAX(RUN, X)
+   ENDDO
+END SUBROUTINE LIMITER_CARRY_SCAN_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE LIMITER_APPLY_KERNEL(RB, N, NB, VAL, IDX, BLK, RCELLSIZE)
+! *****************************************************************************
+! Pass 4: resolve each face value (own, inherited from an earlier node, or the
+! SAVEd value from the previous call) and compute the limited gradients.
+   INTEGER, VALUE :: N, NB
+   REAL, VALUE :: RCELLSIZE
+   REAL, DEVICE :: RB(N,NR), VAL(N,4)
+   INTEGER, DEVICE :: IDX(N,4), BLK(NB,4)
+   INTEGER :: I, B, V, J
+   REAL :: PH(4), DPHIDX, DPHIDY
+   REAL, PARAMETER :: CEILING = 1E3
+
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   B = (I - 1) / TPB + 1
+
+   DO V = 1, 4
+      J = MAX(IDX(I,V), BLK(B,V))
+      IF (J > 0) THEN
+         PH(V) = VAL(J,V)
+      ELSE
+         PH(V) = LIM_CARRY_d(V)
+      ENDIF
+   ENDDO
+
+   DPHIDX = (PH(1) - PH(2)) * RCELLSIZE
+   DPHIDY = (PH(3) - PH(4)) * RCELLSIZE
+
+   IF (DPHIDX .GT.  CEILING) DPHIDX =  CEILING
+   IF (DPHIDY .GT.  CEILING) DPHIDY =  CEILING
+   IF (DPHIDX .LT. -CEILING) DPHIDX = -CEILING
+   IF (DPHIDY .LT. -CEILING) DPHIDY = -CEILING
+   IF (DPHIDX .NE. DPHIDX) DPHIDX = 0.
+   IF (DPHIDY .NE. DPHIDY) DPHIDY = 0.
+
+   RB(I,K_DPHIDX) = DPHIDX
+   RB(I,K_DPHIDY) = DPHIDY
+
+END SUBROUTINE LIMITER_APPLY_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE LIMITER_SAVE_CARRY_KERNEL(N, NB, VAL, IDX, BLK)
+! *****************************************************************************
+! Pass 5: the values left in PHIEAST.. after the last node, for the next call.
+   INTEGER, VALUE :: N, NB
+   REAL, DEVICE :: VAL(N,4)
+   INTEGER, DEVICE :: IDX(N,4), BLK(NB,4)
+   INTEGER :: V, J
+
+   V = threadIdx%x
+   IF (V > 4) RETURN
+   J = MAX(IDX(N,V), BLK(NB,V))
+   IF (J > 0) LIM_CARRY_d(V) = VAL(J,V)
+END SUBROUTINE LIMITER_SAVE_CARRY_KERNEL
+
+! *****************************************************************************
+ATTRIBUTES(GLOBAL) SUBROUTINE RK2_INTEGRATE_KERNEL(RB, IB, N, ISTEP, DT)
+! *****************************************************************************
+! Mirrors RK2_INTEGRATE, writing straight into PHIP_d.
+   INTEGER, VALUE :: N, ISTEP
+   REAL, VALUE :: DT
+   REAL, DEVICE :: RB(N,NR)
+   INTEGER, DEVICE :: IB(N,NI)
+   REAL, PARAMETER :: LIMIT = 1.0
+   INTEGER :: I, IX, IY
+   REAL :: PNEW
+
+   I = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+   IF (I > N) RETURN
+   IX = IB(I,KI_IX)
+   IY = IB(I,KI_IY)
+
+   IF (ISTEP .EQ. 1) THEN
+      PNEW = RB(I,K_PHIP_OLD) - DT * (RB(I,K_UX) * RB(I,K_DPHIDX) + RB(I,K_UY) * RB(I,K_DPHIDY))
+      IF (PNEW .NE. PNEW) PNEW = 1.0 ! NaN check
+      IF (PNEW .LT. -1 * LIMIT) PNEW = -1 * LIMIT
+      IF (PNEW .GT.  LIMIT)     PNEW =  LIMIT
+   ELSE
+      PNEW = 0.5 * (RB(I,K_PHIP_OLD) + (PHIP_d(IX,IY) - DT * (RB(I,K_UX) * RB(I,K_DPHIDX) + RB(I,K_UY) * RB(I,K_DPHIDY))))
+   ENDIF
+
+   IF (IB(I,KI_WTU_SPREAD) .NE. 0) PNEW = -1.0 ! Interface Model
+
+   PHIP_d(IX,IY) = PNEW
+
+END SUBROUTINE RK2_INTEGRATE_KERNEL
 
 END MODULE ELMFIRE_GPU

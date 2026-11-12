@@ -394,6 +394,9 @@ DO WHILE (T .le. totalDuration)
       CALL ACCUMULATE_CPU_USAGE(31, IT1, IT2)
 
       ! Initialize viariables on each new call:
+#ifdef _CUDA
+      CALL GPU_LEVEL_SET_NEW_CASE() ! Full PHIP / static data upload before the first GPU timestep
+#endif
       ITIMESTEP                   = 0
       T_LAST_EXTENDED_ATTACK      = -9E9
       T_LAST_INTERPOLATE_M1       = -9E9
@@ -626,11 +629,7 @@ DO WHILE (T .le. totalDuration)
 
          DO ISTEP=1,2
             ! Calcaulate components of normal vector
-#ifdef _CUDA
-            CALL CALC_NORMAL_VECTORS_CUDA (ISTEP, HALFRCELLSIZE)
-#else
             CALL CALC_NORMAL_VECTORS (ISTEP, HALFRCELLSIZE)
-#endif
 
             ! Calculate x and y components of velocity from elliptical spread dimensions
             CALL UX_AND_UY_ELLIPTICAL(LIST_BURNED, 1.0, ISTEP, DT)
@@ -808,6 +807,9 @@ DO WHILE (T .le. totalDuration)
 
       IF (RANDOM_IGNITIONS) THEN
          PHIP    (IX_IGN,IY_IGN) = -1.0
+#ifdef _CUDA
+         CALL GPU_PHIP_MARK_DIRTY(IX_IGN,IY_IGN)
+#endif
          ! IF (ITIMESTEP .EQ. 1) CALL TAG_BAND(NX,NY,IX_IGN,IY_IGN,T)
          IF (ITIMESTEP .EQ. 1) THEN
             TIME_OF_ARRIVAL(IX_IGN,IY_IGN) = T
@@ -830,6 +832,9 @@ DO WHILE (T .le. totalDuration)
                IX_IGN = ICOL_FROM_X(X_IGN(I),ANALYSIS_XLLCORNER,ANALYSIS_CELLSIZE)
                IY_IGN = IROW_FROM_Y(Y_IGN(I),ANALYSIS_YLLCORNER,ANALYSIS_CELLSIZE)
                PHIP    (IX_IGN,IY_IGN) = -1.0
+#ifdef _CUDA
+               CALL GPU_PHIP_MARK_DIRTY(IX_IGN,IY_IGN)
+#endif
                CYCLE
             endif
             IF (T .GE. T_IGN(I) + (IWX_BAND - 1) * DT_METEOROLOGY) THEN
@@ -837,6 +842,9 @@ DO WHILE (T .le. totalDuration)
                IX_IGN = ICOL_FROM_X(X_IGN(I),ANALYSIS_XLLCORNER,ANALYSIS_CELLSIZE)
                IY_IGN = IROW_FROM_Y(Y_IGN(I),ANALYSIS_YLLCORNER,ANALYSIS_CELLSIZE)
                PHIP    (IX_IGN,IY_IGN) = -1.0
+#ifdef _CUDA
+               CALL GPU_PHIP_MARK_DIRTY(IX_IGN,IY_IGN)
+#endif
                TIME_OF_ARRIVAL(IX_IGN,IY_IGN) = T
                SURFACE_FIRE(IX_IGN,IY_IGN) = 1
 
@@ -1086,14 +1094,38 @@ DO WHILE (T .le. totalDuration)
       ENDIF
 #endif
 
+#ifdef _CUDA
+      IF (GPU_CORE_SUPPORTED()) THEN
+         ! GPU-resident ISTEP loop: LIST_TAGGED is packed once, every stage runs on the
+         ! device against PHIP_d, and results are unpacked once after the loop.
+         CALL GPU_LEVEL_SET_UPLOAD() ! Copy of the necesary data to the GPU
+         CALL ACCUMULATE_CPU_USAGE(40, IT1, IT2)
+
+         DO ISTEP = 1, 2
+            CALL GPU_CALC_NORMAL_VECTORS(ISTEP, HALFRCELLSIZE)
+            CALL ACCUMULATE_CPU_USAGE(41, IT1, IT2)
+
+            CALL GPU_UX_AND_UY_ELLIPTICAL(SURFACE_ACCELERATION_FACTOR, ISTEP)
+            CALL ACCUMULATE_CPU_USAGE(42, IT1, IT2)
+
+            CALL GPU_UPDATE_LOCAL_SPREAD_PROPERTIES()
+            CALL GPU_CFL_AND_FLUX_LIMITER(DT, RCELLSIZE, ISTEP, ITIMESTEP)
+            CALL ACCUMULATE_CPU_USAGE(43, IT1, IT2)
+
+            IF (T + REAL(DT,8) .GT. REAL(TSTOP,8)) DT = MAX(0.0, REAL(TSTOP - T))
+
+            CALL GPU_RK2_INTEGRATE(DT, ISTEP)
+            CALL ACCUMULATE_CPU_USAGE(44, IT1, IT2)
+         ENDDO
+
+         CALL GPU_LEVEL_SET_DOWNLOAD()
+         CALL ACCUMULATE_CPU_USAGE(44, IT1, IT2)
+      ELSE
+#endif
       DO ISTEP = 1, 2
 
          ! Calculate components of normal vector
-#ifdef _CUDA
-         CALL CALC_NORMAL_VECTORS_CUDA (ISTEP, HALFRCELLSIZE)
-#else
          CALL CALC_NORMAL_VECTORS (ISTEP, HALFRCELLSIZE)
-#endif
          CALL ACCUMULATE_CPU_USAGE(41, IT1, IT2)
 
          ! Calculate x and y components of velocity from elliptical spread dimensions
@@ -1109,14 +1141,13 @@ DO WHILE (T .le. totalDuration)
          IF (T + REAL(DT,8) .GT. REAL(TSTOP,8)) DT = MAX(0.0, REAL(TSTOP - T))
 
          ! 2nd order Runge Kutta integration:
-#ifdef _CUDA
-         CALL RK2_INTEGRATE_CUDA(DT, ISTEP)
-#else
          CALL RK2_INTEGRATE(DT, ISTEP)
-#endif
          CALL ACCUMULATE_CPU_USAGE(44, IT1, IT2)
 
       ENDDO !ISTEP=1,2
+#ifdef _CUDA
+      ENDIF ! GPU_CORE_SUPPORTED
+#endif
 
    ! Find newly-burned cells and call spotting:
       N_TO_TAG = 0
@@ -1376,6 +1407,9 @@ DO WHILE (T .le. totalDuration)
                CALL TAG_BAND(NX, NY, IX, IY, T)
                TIME_OF_ARRIVAL(IX,IY) = T
                PHIP           (IX,IY) = -1.0
+#ifdef _CUDA
+               CALL GPU_PHIP_MARK_DIRTY(IX,IY) ! Inside the if, so only mark dirty if the cell is actually been modified
+#endif
                IF (DUMP_EMBER_IGNITION) EMBER_IGNITION_MAP%I2(IX,IY,1) = 1
             ENDIF
          ENDDO
@@ -2292,6 +2326,9 @@ DO
 
    IF (UNTAG_BECAUSE_BURNED) THEN
       PHIP(IX,IY) = -1E0
+#ifdef _CUDA
+      CALL GPU_PHIP_MARK_DIRTY(IX,IY)
+#endif
       NUM_DELETED = NUM_DELETED + 1
       CALL DELETE_NODE(LIST_TAGGED, C)
       TAGGED(IX,IY) = .FALSE.
@@ -2985,6 +3022,9 @@ DO
             TIME_OF_ARRIVAL(IX,IY) = MIN(TIME_OF_ARRIVAL(IX,IY), T_IGNITION)
          ENDIF
          PHIP           (IX,IY) = -1.0
+#ifdef _CUDA
+         CALL GPU_PHIP_MARK_DIRTY(IX,IY)
+#endif
          ! Record firebrand ignited cells
          IF (DUMP_EMBER_IGNITION) EMBER_IGNITION_MAP%I2(IX,IY,1) = 1
          CALL DELETE_NODE(LIST_EMBER_DEPOSITED, C) ! Remove ignited cells
@@ -3056,6 +3096,9 @@ DO I = 1, NUM_TRACKED_EMBERS
             TIME_OF_ARRIVAL(IX,IY) = MIN(TIME_OF_ARRIVAL(IX,IY), T_IGNITION)
          ENDIF
          PHIP           (IX,IY) = -1.0
+#ifdef _CUDA
+         CALL GPU_PHIP_MARK_DIRTY(IX,IY)
+#endif
       ENDIF
 
    ENDIF
@@ -3093,6 +3136,9 @@ IF (TRIM(IGNITION_MODEL) .NE. 'DIRECT') THEN
             CALL TAG_BAND(NX_ELM, NY_ELM, IX, IY, T_IGNITION)
             TIME_OF_ARRIVAL(IX,IY) = T_IGNITION
             PHIP           (IX,IY) = -1.0
+#ifdef _CUDA
+            CALL GPU_PHIP_MARK_DIRTY(IX,IY)
+#endif
             ! Record firebrand ignited cells
             IF (DUMP_EMBER_IGNITION) EMBER_IGNITION_MAP%I2(IX,IY,1) = 1
             CALL DELETE_NODE(LIST_EMBER_DEPOSITED, C) ! Remove ignited cells
